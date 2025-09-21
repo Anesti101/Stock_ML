@@ -1,9 +1,3 @@
-# data_prep.py
-# ============
-# Purpose: Fetch, clean, and prepare market price data for analysis and modeling.
-# Why: Hiring managers want to see reproducible pipelines with clear steps, defensive checks,
-#      and modular functions. This file provides a professional, testable foundation.
-
 from __future__ import annotations  # allows forward type refs in type hints
 from typing import Iterable, Tuple, Optional, Dict
 import logging                     # structured progress + debug info
@@ -46,26 +40,32 @@ def fetch_prices_yfinance(
 
     Why we need it:
         This provides a reproducible, scriptable data source—no manual CSVs—showing you can
-        acquire real-world data programmatically (a core analyst skill).
+        acquire real-world data programmatically.
     """
     # Ensure tickers is a list (some APIs need list-like)
     tickers = list(tickers)  # convert in case a generator/tuple was passed
+    
     # Defensive check: yfinance must be available to fetch remote data
     if yf is None:  # avoid import-time hard failure
         raise ImportError("yfinance is not installed. Run: pip install yfinance")
+    
     # Informative log so users know what's being fetched
     logger.info("Fetching prices for %d tickers from %s to %s at %s interval",
                 len(tickers), start, end, interval)
+    
     # Call Yahoo Finance bulk downloader; returns MultiIndex columns by field→ticker
     df = yf.download(
         tickers=tickers, start=start, end=end, interval=interval,
         auto_adjust=auto_adjust, progress=progress, group_by="column"
     )
+    
     # If nothing returned, raise helpful error
     if df is None or df.empty:
         raise ValueError("No data returned. Check tickers, dates, or interval.")
+    
     # Pick the right field to use: Adjusted Close if auto_adjust else Close
     field = "Adj Close" if auto_adjust else "Close"
+    
     # When multiple tickers, yfinance returns a column level → select field level
     if isinstance(df.columns, pd.MultiIndex):
         df = df[field]  # select the desired price field across tickers
@@ -73,14 +73,17 @@ def fetch_prices_yfinance(
         # Single-ticker case: we rename the single column to the ticker for consistency
         only_ticker = tickers[0]
         df = df.rename(columns={field: only_ticker})[[only_ticker]]
+        
     # Enforce DateTimeIndex, sorted, unique
     df.index = pd.to_datetime(df.index)         # ensure datetime index
     df = df.sort_index()                        # chronological order
     df = df[~df.index.duplicated(keep="first")] # drop duplicate timestamps
-    # Final shape log for transparency
+    
+    # Final shape log for transparency 
     logger.info("Fetched price frame shape: %s", df.shape)
-    # Return wide DataFrame with columns named by ticker
-    return df
+    
+    # Return wide DataFrame with columns named by ticker eg. 'AAPL', 'MSFT' 
+    return df 
 
 
 def validate_price_frame(df: pd.DataFrame) -> None:
@@ -140,7 +143,7 @@ def align_and_fill(
     # Reindex to full calendar; introduces NaNs where data is missing
     aligned = df.reindex(full_index)
     # Forward-fill with a cap so long gaps don't propagate too far
-    aligned = aligned.ffill(limit=ffill_limit)
+    aligned = aligned.ffill(limit=ffill_limit).bfill(limit=1) # backfill 1 to handle leading NaNs
     # Calculate coverage ratio per column after filling
     coverage = aligned.notna().mean(axis=0)
     # Keep only columns meeting the minimum coverage requirement
@@ -174,8 +177,8 @@ def winsorize_outliers(
         Winsorization is a simple, explainable fix that preserves dataset size.
     """
     # Compute per-column mean (μ) and std (σ)
-    mu = df.mean(axis=0)
-    sigma = df.std(axis=0)
+    mu = df.mean(axis=0) # per column maan
+    sigma = df.std(axis=0) # per column std
     # Compute lower and upper caps per column
     lower = mu - z_thresh * sigma
     upper = mu + z_thresh * sigma

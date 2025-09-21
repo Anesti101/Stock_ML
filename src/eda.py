@@ -1,11 +1,3 @@
-# eda.py
-# ======
-# Purpose:
-#   Reusable exploratory data analysis (EDA) utilities for time-series equity data.
-#   Keep notebooks lean by importing these functions instead of rewriting plots each time.
-#
-.
-
 from __future__ import annotations
 
 from typing import Iterable, Optional, Tuple
