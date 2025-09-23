@@ -25,41 +25,41 @@ logger = logging.getLogger(__name__)
 # Core summaries
 # ---------------------------------------------------------------------
 
-def describe_frame(df: pd.DataFrame, percentiles: Iterable[float] = (0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99)) -> pd.DataFrame:
+def describe_frame(
+    df: pd.DataFrame,
+    percentiles: Iterable[float] = (0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99)
+) -> pd.DataFrame:
     """
-    What this does:
-        Returns a rich descriptive statistics table for the given DataFrame.
+    Returns a rich descriptive statistics table for the given DataFrame.
 
-    How it works:
-        - Uses pandas describe with custom percentiles.
-        - Adds count of non-nulls and number of unique values (if low-cardinality).
-
-    Why we need it:
-        Quick sanity check of central tendency, spread, and tails; useful for README tables.
+    - Uses pandas describe with custom percentiles.
+    - Adds count of non-nulls and number of unique values.
+    - Explicitly converts ±inf to NaN to avoid warnings.
     """
     if df.empty:
         raise ValueError("DataFrame is empty.")
 
-    desc = df.describe(percentiles=list(percentiles)).T  # columns → rows for readability
-    desc["non_null"] = df.notna().sum(axis=0)
-    # Only compute nunique when it’s not huge (guard performance)
-    with pd.option_context("mode.use_inf_as_na", True):
-        nun = df.apply(lambda c: c.nunique(dropna=True) if c.nunique(dropna=True) <= 5000 else np.nan)
+    # Replace ±inf with NaN explicitly
+    _df = df.replace([np.inf, -np.inf], np.nan)
+
+    desc = _df.describe(percentiles=list(percentiles)).T
+    desc["non_null"] = _df.notna().sum(axis=0)
+
+    def _nu(c: pd.Series) -> float:
+        v = c.nunique(dropna=True)
+        return v if v <= 5000 else np.nan
+
+    nun = _df.apply(_nu)
     desc["n_unique"] = nun
+
     return desc.sort_index()
+
 
 
 def missingness_report(df: pd.DataFrame) -> pd.DataFrame:
     """
-    What this does:
-        Summarises missing values per column: count, percent, first/last NA dates for time series.
-
-    How it works:
-        - Counts NaNs per column and divides by row count for percentages.
-        - For time series, finds first and last index where column is NA.
-
-    Why we need it:
-        Makes data quality issues obvious and quantifiable before modelling.
+    Summarises missing values per column: count, percent, first/last NA dates for time series.
+    Rows = tickers/columns of df. Columns = ['na_count','na_pct','first_na','last_na'].
     """
     if df.empty:
         raise ValueError("DataFrame is empty.")
@@ -75,11 +75,43 @@ def missingness_report(df: pd.DataFrame) -> pd.DataFrame:
         idx = col.index[mask]
         return (idx.min(), idx.max())
 
-    first_last = df.apply(_first_last_na, axis=0, result_type="expand")
+    # Series(index=ticker, value=(first,last)) → expand to 2 rows then TRANSPOSE
+    first_last = df.apply(_first_last_na, axis=0).apply(pd.Series).T
     first_last.columns = ["first_na", "last_na"]
 
-    out = pd.concat([na_count.rename("na_count"), na_pct.rename("na_pct"), first_last], axis=1)
+    out = pd.concat(
+        [na_count.rename("na_count"), na_pct.rename("na_pct"), first_last],
+        axis=1
+    )
     return out.sort_values("na_pct", ascending=False)
+
+    """
+    Summarises missing values per column: count, percent, first/last NA dates for time series.
+    """
+    if df.empty:
+        raise ValueError("DataFrame is empty.")
+
+    total = len(df)
+    na_count = df.isna().sum()
+    na_pct = (na_count / total) * 100.0
+
+    def _first_last_na(col: pd.Series) -> Tuple[Optional[pd.Timestamp], Optional[pd.Timestamp]]:
+        mask = col.isna()
+        if not mask.any():
+            return (None, None)
+        idx = col.index[mask]
+        return (idx.min(), idx.max())
+
+    # Apply per column, expand tuple → DataFrame
+    first_last = df.apply(_first_last_na, axis=0).apply(pd.Series)
+    first_last.columns = ["first_na", "last_na"]
+
+    out = pd.concat(
+        [na_count.rename("na_count"), na_pct.rename("na_pct"), first_last],
+        axis=1
+    )
+    return out.sort_values("na_pct", ascending=False)
+
 
 
 # ---------------------------------------------------------------------
@@ -334,16 +366,12 @@ def quick_eda_summary(
     max_cols: int = 15,
 ) -> dict[str, pd.DataFrame]:
     """
-    What this does:
-        Produces a compact set of EDA tables you can print or export.
+    Produces a compact set of EDA tables you can print or export.
 
-    How it works:
-        - describe_frame on prices or returns (first non-None).
-        - missingness_report on the same.
-        - correlation matrix on returns if provided (limited to max_cols to keep readable).
-
-    Why we need it:
-        One call to generate the core tables for a README/report; saves time and ensures consistency.
+    - describe_frame on prices or returns.
+    - missingness_report on the same.
+    - correlation matrix on returns if provided.
+    - Cleans ±inf → NaN before analysis for robustness.
     """
     out: dict[str, pd.DataFrame] = {}
 
@@ -351,13 +379,13 @@ def quick_eda_summary(
     if base is None:
         raise ValueError("Provide at least one of `prices` or `returns`.")
 
-    # clip number of columns to keep printed output manageable
-    use = base.iloc[:, :max_cols].copy()
+    # Replace infs to avoid describe/NaN issues
+    use = base.iloc[:, :max_cols].replace([np.inf, -np.inf], np.nan).copy()
 
     out["describe"] = describe_frame(use)
     out["missingness"] = missingness_report(use)
 
     if returns is not None:
-        out["corr"] = returns.iloc[:, :max_cols].corr()
+        out["corr"] = returns.iloc[:, :max_cols].replace([np.inf, -np.inf], np.nan).corr()
 
     return out

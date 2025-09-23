@@ -63,16 +63,29 @@ def fetch_prices_yfinance(
     if df is None or df.empty:
         raise ValueError("No data returned. Check tickers, dates, or interval.")
     
+    
     # Pick the right field to use: Adjusted Close if auto_adjust else Close
     field = "Adj Close" if auto_adjust else "Close"
     
-    # When multiple tickers, yfinance returns a column level → select field level
+    preferred = "Adj Close"
+    fallback = "Close"
+
     if isinstance(df.columns, pd.MultiIndex):
-        df = df[field]  # select the desired price field across tickers
+        level0 = df.columns.get_level_values(0)
+        if preferred in level0:
+            df = df[preferred]
+        elif fallback in level0:
+            df = df[fallback]
+        else:
+            raise KeyError(f"Neither '{preferred}' nor '{fallback}' present in downloaded columns: {sorted(set(level0))}")
     else:
-        # Single-ticker case: we rename the single column to the ticker for consistency
         only_ticker = tickers[0]
-        df = df.rename(columns={field: only_ticker})[[only_ticker]]
+        if preferred in df.columns:
+            df = df.rename(columns={preferred: only_ticker})[[only_ticker]]
+        elif fallback in df.columns:
+            df = df.rename(columns={fallback: only_ticker})[[only_ticker]]
+        else:
+            raise KeyError(f"Single-ticker download missing '{preferred}' and '{fallback}'. Columns: {df.columns.tolist()}")
         
     # Enforce DateTimeIndex, sorted, unique
     df.index = pd.to_datetime(df.index)         # ensure datetime index
