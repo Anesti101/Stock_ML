@@ -56,12 +56,13 @@ def fetch_prices_yfinance(
     # Call Yahoo Finance bulk downloader; returns MultiIndex columns by field→ticker
     df = yf.download(
         tickers=tickers, start=start, end=end, interval=interval,
-        auto_adjust=auto_adjust, progress=progress, group_by="column"
+        auto_adjust=False, progress=progress, group_by="column" 
     )
     
     # If nothing returned, raise helpful error
     if df is None or df.empty:
         raise ValueError("No data returned. Check tickers, dates, or interval.")
+    
     
     
     # Pick the right field to use: Adjusted Close if auto_adjust else Close
@@ -97,6 +98,39 @@ def fetch_prices_yfinance(
     
     # Return wide DataFrame with columns named by ticker eg. 'AAPL', 'MSFT' 
     return df 
+
+def fetch_volumes_yfinance(
+    tickers: Iterable[str],
+    start: str,
+    end: str,
+    interval: str = "1d",
+    progress: bool = False,
+) -> pd.DataFrame:
+    logger.info("Fetching volumes for %d tickers from %s to %s at %s interval",
+                len(tickers), start, end, interval)
+    df = yf.download(
+        tickers=tickers, start=start, end=end, interval=interval,
+        auto_adjust=False, progress=progress, group_by="column"
+    )
+    if df is None or df.empty:
+        raise ValueError("No volume data returned. Check tickers, dates, or interval.")
+    if isinstance(df.columns, pd.MultiIndex):
+        if "Volume" in df.columns.get_level_values(0):
+            df = df["Volume"]
+        else:
+            raise KeyError("'Volume' not present in downloaded columns")
+    else:
+        only = list(tickers)[0]
+        if "Volume" in df.columns:
+            df = df.rename(columns={"Volume": only})[[only]]
+        else:
+            raise KeyError(f"Single-ticker download missing 'Volume'. Columns: {df.columns.tolist()}")
+    df.index = pd.to_datetime(df.index)
+    df = df.sort_index()
+    df = df[~df.index.duplicated(keep="first")]
+    logger.info("Fetched volume frame shape: %s", df.shape)
+    return df
+
 
 
 def validate_price_frame(df: pd.DataFrame) -> None:
@@ -333,7 +367,7 @@ def prepare_price_data(
     min_coverage: float = 0.8,
     winsorize_z: Optional[float] = 6.0,
     feature_windows: Tuple[int, int, int] = (5, 20, 60),
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> Tuple [pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     What this does:
         High-level pipeline to fetch → validate → align/fill → (optional) winsorize → compute returns
@@ -355,15 +389,35 @@ def prepare_price_data(
     prices = fetch_prices_yfinance(
         tickers=tickers, start=start, end=end, interval=interval, auto_adjust=True
     )
+    volumes = fetch_volumes_yfinance(
+        tickers=tickers, start=start, end=end, interval=interval
+    )
+        
+    
+    # 1b) Fetch volumes (ensure we ALWAYS assign `volumes`)
+    try:
+        volumes = fetch_volumes_yfinance(
+            tickers=tickers, start=start, end=end, interval=interval
+        )
+    except Exception as e:
+        logger.warning("Volume fetch failed (%s). Using empty frame aligned to prices.", e)
+        # Create an empty frame aligned to prices to avoid UnboundLocalError downstream
+        volumes = pd.DataFrame(index=prices.index, columns=prices.columns, dtype="float64")
+
+    
     # Step 2: validate the fetched price frame
     validate_price_frame(prices)
     # Step 3: align to a common calendar and fill small gaps
     prices = align_and_fill(
         prices, freq=calendar_freq, ffill_limit=ffill_limit, min_coverage=min_coverage
     )
+    volumes = align_and_fill(
+        volumes, freq=calendar_freq, ffill_limit=ffill_limit, min_coverage=min_coverage
+    )
     # Optional: cap outliers to reduce extreme effects before returns/features
     if winsorize_z is not None:
         prices = winsorize_outliers(prices, z_thresh=winsorize_z)
+        
     # Step 4: compute returns
     returns = compute_returns(prices, kind=return_kind)
     # Step 5: create technical features
@@ -372,4 +426,4 @@ def prepare_price_data(
     logger.info("Final shapes → prices:%s returns:%s features:%s",
                 prices.shape, returns.shape, features.shape)
     # Return prepared artifacts
-    return prices, returns, features
+    return prices, returns, features, volumes

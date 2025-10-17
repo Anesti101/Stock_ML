@@ -295,6 +295,21 @@ def gravity_signals_pipeline(
     # Compute daily returns if not provided (log returns, safe default)
     if returns is None:
         returns = np.log(prices).diff()
+        
+    chosen_method = mass_method
+    if mass_method == "dollar_volume" and volume is None:
+        logger.warning(
+            "mass_method='dollar_volume' requires 'volume', but none was provided."
+            " falling back to mass_method = 'equal'"
+        )
+        chosen_method = "equal"
+    
+    if mass_method == "market_cap" and market_caps is None:
+        logger.warning(
+            "mass_method='market_cap' requires 'market_caps', but none provided. "
+            "Falling back to mass_method='equal'."
+        )
+        chosen_method = "equal"
 
     # Masses: either from market_caps or rolling dollar volume
     masses = compute_masses(
@@ -304,7 +319,9 @@ def gravity_signals_pipeline(
         method=mass_method,
         roll_window=mass_window,
     )
-
+    
+    massess = masses.ffill().bfill() # to ensure masses have minimal gaps 
+    
     # Momentum used for direction; z-scored cross-sectionally
     mom = compute_momentum(
         prices=prices,
@@ -326,7 +343,7 @@ def gravity_signals_pipeline(
     # Iterate only over dates for which we have a valid distance matrix
     for dt, dist in dist_mats.items():
         # Extract masses for this date; forward-fill to ensure availability
-        m_t = masses.loc[:dt].iloc[-1].reindex(dist.index).fillna(method=None)
+        m_t = masses.loc[:dt].iloc[-1].reindex(dist.index, fill_value=(0.0))
         # Compute pairwise forces at this date
         F_t = gravity_force_matrix(
             masses=m_t,
@@ -336,14 +353,15 @@ def gravity_signals_pipeline(
             cap=force_cap,
         )
         # Use momentum direction at 'dt' (per-asset)
-        mom_t = mom.loc[dt].reindex(F_t.columns).fillna(0.0)
+        mom_t = mom.reindex(index=[dt]).iloc[0].reindex(F_t.columns).fillna(0.0) # fill missing momemtum with 0
         # Net force per asset at 'dt'
         s_t = net_force_signal(F_t, momentum=mom_t, normalise=False)
         # Store
         signals[dt] = s_t
 
     # Concatenate daily Series into a DataFrame (index=date, columns=assets)
-    signal_df = pd.DataFrame(signals).T.reindex(index=prices.index)
+    signal_df = pd.DataFrame(signals).T # .reindex(index=prices.index)
+    signal_df = pd.DataFrame(signals).T.reindex(index=prices.index) # align to full date index
 
     # Optionally z-score per day to stabilise scale
     if zscore_signals:
