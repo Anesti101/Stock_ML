@@ -34,7 +34,7 @@ signals = gravity_signals_pipeline(
     volume=vols,  # trading volume data 
     mass_method="dollar_volume", # mass based on dollar volume 
     mass_window=60, # lookback window for mass calc 
-    dist_window=120, # lookback window for distance calc
+    dist_window=60, # lookback window for distance calc
     momentum_lookback=240, # momentum lookback for distance calc
 )
 
