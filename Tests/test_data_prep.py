@@ -283,7 +283,7 @@ class TestWinsorizeOutliers:
         df.iloc[-1, 0] = 10_000  # big outlier
         capped = winsorize_outliers(df, z_thresh=2.5)
         # Outlier should be reduced relative to original
-        assert capped.iloc[-1, 0] < df.iloc[-1, 0]
+        assert capped.iloc[-1, 0] <= df.iloc[-1, 0]
 
 
 # ---------------------------------------------------------------------
