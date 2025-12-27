@@ -209,7 +209,7 @@ def winsorize_outliers(
     df: pd.DataFrame,
     z_thresh: float = 6.0,
 ) -> pd.DataFrame:
-    """
+    """                                                                                                                                                           
     What this does:
         Caps extreme values (per column) based on a z-score threshold to reduce the impact
         of outliers without removing rows.
@@ -221,7 +221,7 @@ def winsorize_outliers(
 
     Why we need it:
         Spurious ticks/splits can create extreme values that distort stats and charts.
-        Winsorization is a simple, explainable fix that preserves dataset size.
+        Winsorisation is a simple, explainable fix that preserves dataset size.
     """
     # Compute per-column mean (μ) and std (σ)
     mu = df.mean(axis=0) # per column maan

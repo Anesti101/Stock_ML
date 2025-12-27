@@ -1,0 +1,25 @@
+review:
+  level: high
+  language: python
+  summarize_pr: true
+  suggestions: true
+  comment_style: concise
+  detect_bugs: true
+  detect_performance_issues: true
+  detect_style_issues: false  # ignore small stylistic nits
+  detect_security_issues: true
+
+context:
+  project_type: "machine_learning"
+  description: "Gravity-inspired stock prediction model using yfinance, pandas, and XGBoost."
+  focus_areas:
+    - "data cleaning"
+    - "feature engineering"
+    - "model validation"
+    - "pipeline performance"
+
+ignore:
+  - "*.md"
+  - "notebooks/*"
+  - "data/*"
+  - "plots/*"
