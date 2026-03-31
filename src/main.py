@@ -2,6 +2,7 @@ from data_prep import prepare_price_data
 from eda import quick_eda_summary, plot_price_trends
 from gravity_model import gravity_signals_pipeline, information_coefficient
 import matplotlib.pyplot as plt
+import numpy as np
 
 # --- Step 1: fetch and prep data ---
 # Expanded from 6 to 30 tickers across 7 sectors for meaningful cross-sectional IC.
@@ -58,8 +59,8 @@ print(f"\nTrain period: {prices.index[0].date()} to {TRAIN_END}")
 print(f"Test period:  {TEST_START} to {prices.index[-1].date()}")
 print(f"Horizon:      {HORIZON} days (pre-specified, not searched)")
 
-# Forward returns at the pre-specified horizon
-fwd = prices.pct_change(HORIZON).shift(-HORIZON)
+# Forward log-returns at the pre-specified horizon (log convention matches returns used in model)
+fwd = np.log(prices).diff(HORIZON).shift(-HORIZON)
 
 # --- Step 5: Parameter search on TRAIN data only ---
 print("\n" + "="*60)

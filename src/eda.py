@@ -85,33 +85,6 @@ def missingness_report(df: pd.DataFrame) -> pd.DataFrame:
     )
     return out.sort_values("na_pct", ascending=False)
 
-    """
-    Summarises missing values per column: count, percent, first/last NA dates for time series.
-    """
-    if df.empty:
-        raise ValueError("DataFrame is empty.")
-
-    total = len(df)
-    na_count = df.isna().sum()
-    na_pct = (na_count / total) * 100.0
-
-    def _first_last_na(col: pd.Series) -> Tuple[Optional[pd.Timestamp], Optional[pd.Timestamp]]:
-        mask = col.isna()
-        if not mask.any():
-            return (None, None)
-        idx = col.index[mask]
-        return (idx.min(), idx.max())
-
-    # Apply per column, expand tuple → DataFrame
-    first_last = df.apply(_first_last_na, axis=0).apply(pd.Series)
-    first_last.columns = ["first_na", "last_na"]
-
-    out = pd.concat(
-        [na_count.rename("na_count"), na_pct.rename("na_pct"), first_last],
-        axis=1
-    )
-    return out.sort_values("na_pct", ascending=False)
-
 
 
 # ---------------------------------------------------------------------
