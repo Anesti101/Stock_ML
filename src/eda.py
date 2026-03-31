@@ -359,6 +359,7 @@ def quick_eda_summary(
     out["missingness"] = missingness_report(use)
 
     if returns is not None:
-        out["corr"] = returns.iloc[:, :max_cols].replace([np.inf, -np.inf], np.nan).corr()
+        with np.errstate(invalid="ignore", divide="ignore"):
+            out["corr"] = returns.iloc[:, :max_cols].replace([np.inf, -np.inf], np.nan).corr()
 
     return out

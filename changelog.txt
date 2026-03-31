@@ -355,6 +355,131 @@ Reason for session: Third iterative pass — fix newly introduced bugs, dead cod
           an unnecessary intermediate allocation per iteration. `mom.loc[dt]`
           returns the same Series directly in O(1).
 
+--------------------------------------------------------------------------------
+2026-03-31 | main.py + gravity_model.py + eda.py + data_prep.py
+Reason for session: Fix runtime crashes and warnings found by actually running main.py
+--------------------------------------------------------------------------------
+
+[2026-03-31] main.py — print() encoding crash
+  CHANGE: Replaced `"  → Train IC: ..."` with `"  -> Train IC: ..."`.
+  WHY:    The Unicode arrow U+2192 cannot be encoded in the Windows cp1252 console
+          code page, causing UnicodeEncodeError and terminating the script before
+          any parameter search results were printed.
+
+[2026-03-31] gravity_model.py — gravity_signals_pipeline() min_periods guard
+  CHANGE: Added `effective_min_periods = min(dist_min_periods, dist_window)` and
+          pass that to correlation_distance instead of dist_min_periods directly.
+  WHY:    pandas raises ValueError when min_periods > window in rolling().corr().
+          The old Python-loop implementation silently returned an empty dict when
+          min_periods > window (all dates were skipped); the vectorised version
+          crashes immediately. Clamping to dist_window restores the graceful
+          behaviour: configs like {dist_window=20, dist_min_periods=30} now
+          produce signals starting from when dist_window observations are available,
+          rather than crashing.
+
+[2026-03-31] gravity_model.py — information_coefficient() RuntimeWarning
+  CHANGE: Wrapped the per-date `x_rank.corr(y_rank)` / `x.corr(y)` calls with
+          `np.errstate(invalid="ignore", divide="ignore")`.
+  WHY:    When a stock has all-tied ranks on a given date (zero standard deviation),
+          numpy's corrcoef divides by zero and emits a RuntimeWarning. The NaN
+          result is already correctly handled by the `pd.notna(val)` guard below.
+          The warning was expected and benign but cluttered the output across every
+          date in the 5-config parameter search.
+
+[2026-03-31] eda.py — quick_eda_summary() RuntimeWarning
+  CHANGE: Wrapped `returns.corr()` with `np.errstate(invalid="ignore", divide="ignore")`.
+  WHY:    Same root cause as above. pandas DataFrame.corr() calls numpy's corrcoef
+          internally; when any return column has near-zero variance, it emits the
+          same divide-by-zero RuntimeWarning. Suppressed because NaN correlations
+          are the expected result for such columns.
+
+[2026-03-31] main.py — best config selection
+  CHANGE: Changed `if best_train_ic is None or abs(mean_ic) > abs(best_train_ic):`
+          to `if best_train_ic is None or mean_ic > best_train_ic:`.
+  WHY:    The old logic selected the config with the highest absolute IC, which
+          would prefer a large-negative IC over a small-positive one. Since the
+          signal is used as-is (no automatic sign flip), picking the most positive
+          IC is correct. Selecting a strongly negative IC as "best" and then using
+          the signal without inversion produces a backwards predictor.
+
+[2026-03-31] data_prep.py — logger.info arrow character
+  CHANGE: Replaced `"Final shapes -> prices:..."` with `"Final shapes - prices:..."`.
+  WHY:    The `->` in logger.info was displaying as `\u2192` in the cp1252 Windows
+          terminal because the logging handler writes directly to stderr without
+          going through Python's print() encoding path.
+
+--------------------------------------------------------------------------------
+2026-03-31 | signal_pipeline.py (NEW) + main.py
+Reason for session: Implement full 7-step post-processing pipeline for gravity signals
+--------------------------------------------------------------------------------
+
+[2026-03-31] signal_pipeline.py — CREATED
+  CHANGE: New module with 7 pipeline steps as standalone functions:
+          volatility_scale, cross_sectional_rank, regime_filter,
+          combine_with_momentum, construct_portfolio, evaluate_pipeline,
+          plot_pipeline_results.
+  WHY:    Raw gravity signals are z-scored but not regime-aware or vol-adjusted.
+          Adding vol scaling, cross-sectional ranking, a bearish-regime filter,
+          and a momentum blend provides a more complete, deployable signal.
+          Separating into a module keeps main.py readable and each function
+          independently testable.
+
+[2026-03-31] signal_pipeline.py — volatility_scale()
+  CHANGE: Divides raw signal by rolling 20-day std of returns (shifted 1 day).
+  WHY:    Signal magnitude relative to vol is what drives risk-adjusted returns.
+          A large signal during a low-vol period is more meaningful than the
+          same signal during a crash. Shifting returns by 1 day prevents
+          look-ahead bias (today's vol is not known until today's close).
+
+[2026-03-31] signal_pipeline.py — cross_sectional_rank()
+  CHANGE: Converts each row (date) to percentile ranks in [0, 1] using
+          pandas rank(pct=True).
+  WHY:    Ranking neutralises outliers and makes the signal units-invariant.
+          It is equivalent to transforming into a uniform distribution, which
+          helps the long-short portfolio construction step.
+
+[2026-03-31] signal_pipeline.py — regime_filter()
+  CHANGE: Zeros out all signals on days when MA50 <= MA200 (bearish regime),
+          using equal-weighted average price as the default benchmark.
+  WHY:    Long-short momentum strategies historically underperform in bear
+          markets (momentum crashes). Flat-positioning during drawdown periods
+          can improve Sharpe without large IC cost.
+
+[2026-03-31] signal_pipeline.py — combine_with_momentum()
+  CHANGE: Blends gravity rank (70%) with 60-day cumulative-return momentum
+          rank (30%). Momentum is also shifted 1 day to avoid look-ahead.
+  WHY:    Both gravity and momentum signals have documented positive IC.
+          Combining two independently-positive signals reduces variance of
+          the combined IC (diversification benefit).
+
+[2026-03-31] signal_pipeline.py — construct_portfolio()
+  CHANGE: Long top 20%, short bottom 20% by signal rank on each day.
+          Returns are from the *next* date to avoid look-ahead bias.
+          Each leg equally weighted; portfolio is dollar-neutral.
+  WHY:    Standard long-short equity construction; directly computable
+          Sharpe makes the signal actionable and benchmarkable.
+
+[2026-03-31] signal_pipeline.py — evaluate_pipeline()
+  CHANGE: Computes IC, ICIR, annualised Sharpe, annual return, annual vol,
+          and cumulative log-return for any signal/portfolio pair.
+  WHY:    Single evaluation function used for both train and test periods
+          so results are comparable and consistently computed.
+
+[2026-03-31] signal_pipeline.py — plot_pipeline_results()
+  CHANGE: Three-panel figure: 60-day rolling IC, cumulative portfolio returns,
+          IC distribution histogram. One call per period (train / test).
+  WHY:    Requested visualisations; three panels in one figure avoids
+          window proliferation and makes the diagnostics easy to compare.
+
+[2026-03-31] main.py
+  CHANGE: Added imports from signal_pipeline; renamed gravity output to
+          raw_signals; inserted pipeline steps P1-P7 after the existing
+          gravity evaluation; kept all original gravity IC prints intact.
+  WHY:    Pipeline steps are additive — original gravity IC numbers are
+          preserved as a baseline. The new section shows whether the
+          post-processing steps improve IC, ICIR, and Sharpe on the
+          out-of-sample test period.
+
 ================================================================================
 END OF CHANGELOG
 ================================================================================

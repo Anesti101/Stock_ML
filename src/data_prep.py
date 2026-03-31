@@ -490,7 +490,7 @@ def prepare_price_data(
     # Step 5: create technical features
     features = add_technical_features(prices=prices, returns=returns, windows=feature_windows)
     # Log final shapes for transparency
-    logger.info("Final shapes → prices:%s returns:%s features:%s",
+    logger.info("Final shapes - prices:%s returns:%s features:%s",
                 prices.shape, returns.shape, features.shape)
     # Return prepared artifacts
     return prices, returns, features, volumes

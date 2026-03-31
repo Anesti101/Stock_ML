@@ -112,7 +112,10 @@ def correlation_distance(
     # Compute ALL pairwise rolling correlations in one vectorised call using
     # pandas' C backend. This avoids the O(n * p^2) Python loop that called
     # window_slice.corr() on every single date.
-    rolling_corr = returns.rolling(window=window, min_periods=min_periods).corr()
+    # Suppress the divide-by-zero warning that fires when a stock has zero
+    # variance in a window — the resulting NaN is handled by fillna(0.0) below.
+    with np.errstate(invalid="ignore", divide="ignore"):
+        rolling_corr = returns.rolling(window=window, min_periods=min_periods).corr()
 
     # rolling_corr has a 2-level MultiIndex: (date, ticker). Group by date and
     # build one distance matrix per date — only a cheap Python groupby, not a
@@ -344,11 +347,14 @@ def gravity_signals_pipeline(
         )
         mom = _zscore_by_row(mom - reversal_weight * rev)
 
-    # Rolling correlation distance matrices per date
+    # Rolling correlation distance matrices per date.
+    # min_periods must be <= window; clamp silently so configs like
+    # {dist_window=20, dist_min_periods=30} don't raise ValueError.
+    effective_min_periods = min(dist_min_periods, dist_window)
     dist_mats = correlation_distance(
         returns=returns,
         window=dist_window,
-        min_periods=dist_min_periods,
+        min_periods=effective_min_periods,
         eps=eps,
     )
 
@@ -425,13 +431,16 @@ def information_coefficient(
         y = y[mask]
         if len(x) < 3:
             continue
-        if method == "spearman":
-            # rank transform then Pearson on ranks
-            x_rank = x.rank()
-            y_rank = y.rank()
-            val = x_rank.corr(y_rank)
-        else:
-            val = x.corr(y)
+        # Suppress divide-by-zero from np.corrcoef when a stock has all-tied
+        # ranks (zero std). The NaN result is filtered by the pd.notna check below.
+        with np.errstate(invalid="ignore", divide="ignore"):
+            if method == "spearman":
+                # rank transform then Pearson on ranks
+                x_rank = x.rank()
+                y_rank = y.rank()
+                val = x_rank.corr(y_rank)
+            else:
+                val = x.corr(y)
         if pd.notna(val):
             ic_values.append(val)
             dates.append(dt)

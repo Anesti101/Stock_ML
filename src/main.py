@@ -1,6 +1,15 @@
 from data_prep import prepare_price_data
 from eda import quick_eda_summary, plot_price_trends
 from gravity_model import gravity_signals_pipeline, information_coefficient
+from signal_pipeline import (
+    volatility_scale,
+    cross_sectional_rank,
+    regime_filter,
+    combine_with_momentum,
+    construct_portfolio,
+    evaluate_pipeline,
+    plot_pipeline_results,
+)
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -99,9 +108,9 @@ for config in param_configs:
         signals_cfg.loc[:TRAIN_END], fwd.loc[:TRAIN_END], method="spearman"
     )
     mean_ic = ic_cfg.mean()
-    print(f"  → Train IC: {mean_ic:.4f}")
+    print(f"  -> Train IC: {mean_ic:.4f}")
 
-    if best_train_ic is None or abs(mean_ic) > abs(best_train_ic):
+    if best_train_ic is None or mean_ic > best_train_ic:
         best_train_ic = mean_ic
         best_config = config
 
@@ -113,7 +122,7 @@ print("\n" + "="*60)
 print("FINAL EVALUATION: Out-of-sample test period (2023-2024)")
 print("="*60)
 
-signals = gravity_signals_pipeline(
+raw_signals = gravity_signals_pipeline(
     prices=prices,
     returns=rets,
     volume=vols,
@@ -124,36 +133,116 @@ signals = gravity_signals_pipeline(
     reversal_lookback=best_config["reversal_lookback"],
 )
 
-print("\nSignal statistics (full period):")
-print("  Mean:", signals.mean().mean())
-print("  Std:", signals.std().mean())
-print("  Min:", signals.min().min())
-print("  Max:", signals.max().max())
-print("  Skewness:", signals.skew().mean())
+print("\nRaw signal statistics (full period):")
+print("  Mean:", raw_signals.mean().mean())
+print("  Std:", raw_signals.std().mean())
+print("  Min:", raw_signals.min().min())
+print("  Max:", raw_signals.max().max())
+print("  Skewness:", raw_signals.skew().mean())
 
-# Out-of-sample IC — this is the honest number
-ic_test = information_coefficient(
-    signals.loc[TEST_START:], fwd.loc[TEST_START:], method="spearman"
+# Out-of-sample IC on raw gravity signal
+ic_test_raw = information_coefficient(
+    raw_signals.loc[TEST_START:], fwd.loc[TEST_START:], method="spearman"
 )
-ic_train = information_coefficient(
-    signals.loc[:TRAIN_END], fwd.loc[:TRAIN_END], method="spearman"
+ic_train_raw = information_coefficient(
+    raw_signals.loc[:TRAIN_END], fwd.loc[:TRAIN_END], method="spearman"
 )
 
-print(f"\nTrain IC (in-sample,     reference only): {ic_train.mean():.4f}")
-print(f"Test  IC (out-of-sample, honest result):  {ic_test.mean():.4f}")
-print(f"Train ICIR: {ic_train.mean() / (ic_train.std() + 1e-12):.4f}")
-print(f"Test  ICIR: {ic_test.mean() / (ic_test.std() + 1e-12):.4f}")
+print(f"\nRaw gravity signal:")
+print(f"  Train IC (in-sample,     reference only): {ic_train_raw.mean():.4f}")
+print(f"  Test  IC (out-of-sample, honest result):  {ic_test_raw.mean():.4f}")
+print(f"  Train ICIR: {ic_train_raw.mean() / (ic_train_raw.std() + 1e-12):.4f}")
+print(f"  Test  ICIR: {ic_test_raw.mean() / (ic_test_raw.std() + 1e-12):.4f}")
 
-# --- Step 7: Plot out-of-sample IC only ---
-ic_test_rolling = ic_test.rolling(window=30).mean()
+# =========================================================================
+# SIGNAL PIPELINE (Steps 1-7 from signal_pipeline.py)
+# =========================================================================
+
+print("\n" + "="*60)
+print("SIGNAL PIPELINE: Volatility-scaled, ranked, regime-filtered")
+print("="*60)
+
+# Step P1: Volatility scaling — divides signal by rolling 20-day return std
+scaled = volatility_scale(raw_signals, rets, window=20)
+
+# Step P2: Cross-sectional ranking — converts to percentile ranks [0, 1]
+ranked = cross_sectional_rank(scaled)
+
+# Step P3: Regime filter — zero out signals on bearish days (MA50 < MA200)
+# Uses equal-weighted average of all assets as the regime benchmark
+filtered = regime_filter(ranked, prices, ma_short=50, ma_long=200)
+
+# Step P4: Momentum combination — blend gravity rank (70%) with momentum rank (30%)
+final_signal = combine_with_momentum(
+    filtered, rets, momentum_weight=0.3, lookback=60
+)
+
+print("\nFinal pipeline signal statistics (full period):")
+print("  Mean:", final_signal.mean().mean())
+print("  Std:", final_signal.std().mean())
+print("  Min:", final_signal.min().min())
+print("  Max:", final_signal.max().max())
+
+# Step P5: Portfolio construction — long top 20%, short bottom 20%
+port_returns_train = construct_portfolio(
+    final_signal.loc[:TRAIN_END], rets.loc[:TRAIN_END], top_pct=0.2
+)
+port_returns_test = construct_portfolio(
+    final_signal.loc[TEST_START:], rets.loc[TEST_START:], top_pct=0.2
+)
+
+# Step P6: Evaluation — IC, ICIR, Sharpe
+metrics_train = evaluate_pipeline(
+    final_signal.loc[:TRAIN_END],
+    fwd.loc[:TRAIN_END],
+    port_returns_train,
+)
+metrics_test = evaluate_pipeline(
+    final_signal.loc[TEST_START:],
+    fwd.loc[TEST_START:],
+    port_returns_test,
+)
+
+print("\nPipeline metrics — TRAIN (in-sample, reference only):")
+print(f"  IC:              {metrics_train['mean_ic']:.4f}")
+print(f"  ICIR:            {metrics_train['icir']:.4f}")
+print(f"  Sharpe:          {metrics_train['sharpe']:.4f}")
+print(f"  Annual return:   {metrics_train['annual_return']:.4f}")
+print(f"  Annual vol:      {metrics_train['annual_vol']:.4f}")
+print(f"  Cumulative ret:  {metrics_train['cumulative_return']:.4f}")
+
+print("\nPipeline metrics — TEST (out-of-sample, honest result):")
+print(f"  IC:              {metrics_test['mean_ic']:.4f}")
+print(f"  ICIR:            {metrics_test['icir']:.4f}")
+print(f"  Sharpe:          {metrics_test['sharpe']:.4f}")
+print(f"  Annual return:   {metrics_test['annual_return']:.4f}")
+print(f"  Annual vol:      {metrics_test['annual_vol']:.4f}")
+print(f"  Cumulative ret:  {metrics_test['cumulative_return']:.4f}")
+
+# Step P7: Visualisations — rolling IC, cumulative returns, IC histogram
+# Show train and test panels side-by-side for comparison
+plot_pipeline_results(
+    metrics_train,
+    port_returns_train,
+    title_prefix=f"Train ({prices.index[0].date()} to {TRAIN_END})",
+)
+
+plot_pipeline_results(
+    metrics_test,
+    port_returns_test,
+    title_prefix=f"Test ({TEST_START} to {prices.index[-1].date()})",
+)
+
+# Legacy plot: raw out-of-sample IC time series
+ic_test_rolling = ic_test_raw.rolling(window=30).mean()
 
 plt.figure(figsize=(10, 5))
-plt.plot(ic_test, alpha=0.3, label="Daily IC (test)", linewidth=0.8)
+plt.plot(ic_test_raw, alpha=0.3, label="Daily IC (test, raw gravity)", linewidth=0.8)
 plt.plot(ic_test_rolling, color="red", label="30-day rolling mean", linewidth=2)
 plt.axhline(0, color="black", linestyle="--", linewidth=1)
 plt.axhline(
-    ic_test.mean(), color="blue", linestyle="--", linewidth=1,
-    label=f"Mean IC = {ic_test.mean():.4f}"
+    ic_test_raw.mean(), color="blue", linestyle="--", linewidth=1,
+    label=f"Mean IC = {ic_test_raw.mean():.4f}"
 )
 plt.title(
     f"Out-of-Sample IC (Spearman) — {HORIZON}-day horizon "
