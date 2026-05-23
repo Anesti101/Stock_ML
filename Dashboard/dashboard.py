@@ -486,4 +486,8 @@ def update_charts(data_dict, ticker):
 if __name__ == '__main__':
     logger.info("Starting Stock Market Dashboard...")
     logger.info("Navigate to http://localhost:8050")
+<<<<<<< HEAD
     app.run_server(debug=True, host='0.0.0.0', port=8050)
+=======
+    app.run_server(debug=True, host='0.0.0.0', port=8050)
+>>>>>>> 42feef065a94f074c01fe79e91a56ee1602a6361
