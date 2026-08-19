@@ -18,6 +18,15 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _configure_yfinance_cache() -> None:
+    """Use a repo-local yfinance SQLite cache when the package supports it."""
+    if yf is None or not hasattr(yf, "set_tz_cache_location"):
+        return
+    cache_dir = Path(__file__).resolve().parent.parent / ".yfinance_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    yf.set_tz_cache_location(str(cache_dir))
+
+
 def fetch_prices_yfinance(
     tickers: Iterable[str],
     start: str,
@@ -48,6 +57,7 @@ def fetch_prices_yfinance(
     # Defensive check: yfinance must be available to fetch remote data
     if yf is None:  # avoid import-time hard failure
         raise ImportError("yfinance is not installed. Run: pip install yfinance")
+    _configure_yfinance_cache()
     
     # Informative log so users know what's being fetched
     logger.info("Fetching prices for %d tickers from %s to %s at %s interval",
@@ -103,6 +113,9 @@ def fetch_volumes_yfinance(
     interval: str = "1d",
     progress: bool = False,
 ) -> pd.DataFrame:
+    if yf is None:
+        raise ImportError("yfinance is not installed. Run: pip install yfinance")
+    _configure_yfinance_cache()
     logger.info("Fetching volumes for %d tickers from %s to %s at %s interval",
                 len(tickers), start, end, interval)
     df = yf.download(
@@ -155,6 +168,7 @@ def _fetch_prices_and_volumes(
     """
     if yf is None:
         raise ImportError("yfinance is not installed. Run: pip install yfinance")
+    _configure_yfinance_cache()
 
     logger.info(
         "Fetching prices+volumes for %d tickers from %s to %s at %s interval (single download)",
@@ -244,8 +258,10 @@ def validate_price_frame(df: pd.DataFrame) -> None:
     # No duplicate timestamps allowed
     if df.index.has_duplicates:
         raise ValueError("Index contains duplicate timestamps.")
-    # Columns must be numeric (floats/ints) for return calculations
-    if not all(np.issubdtype(dtype, np.number) for dtype in df.dtypes):
+    # Columns must be numeric (floats/ints) for return calculations.
+    # Pandas extension dtypes such as StringDtype can raise inside
+    # np.issubdtype, so use pandas' dtype predicate for a clean error.
+    if not all(pd.api.types.is_numeric_dtype(dtype) for dtype in df.dtypes):
         raise TypeError("All columns must be numeric types.")
 
 
@@ -462,14 +478,27 @@ def prepare_price_data(
             tickers=tickers, start=start, end=end, interval=interval
         )
     except Exception as e:
-        # If the combined fetch fails, fall back to prices-only fetch with empty volumes
+        # If the combined fetch fails, fall back to the separately exposed
+        # fetch helpers. Tests and notebooks can mock these helpers directly,
+        # and real runs still get volume data when the second request works.
         logger.warning(
-            "Combined price+volume fetch failed (%s). Retrying prices-only; volumes will be empty.", e
+            "Combined price+volume fetch failed (%s). Retrying separate price and volume fetches.", e
         )
         prices = fetch_prices_yfinance(
             tickers=tickers, start=start, end=end, interval=interval, auto_adjust=True
         )
-        volumes = pd.DataFrame(index=prices.index, columns=prices.columns, dtype="float64")
+        try:
+            volumes = fetch_volumes_yfinance(
+                tickers=tickers, start=start, end=end, interval=interval
+            )
+        except Exception as volume_error:
+            logger.warning(
+                "Separate volume fetch failed (%s). Continuing with empty volumes.",
+                volume_error,
+            )
+            volumes = pd.DataFrame(
+                index=prices.index, columns=prices.columns, dtype="float64"
+            )
 
     # Step 2: validate the fetched price frame
     validate_price_frame(prices)

@@ -1,3 +1,9 @@
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import pandas as pd
+
 from data_prep import prepare_price_data
 from eda import quick_eda_summary, plot_price_trends
 from gravity_model import gravity_signals_pipeline, information_coefficient
@@ -10,8 +16,15 @@ from signal_pipeline import (
     evaluate_pipeline,
     plot_pipeline_results,
 )
-import matplotlib.pyplot as plt
-import numpy as np
+from supervised_regression import (
+    TARGET_END_COLUMN,
+    build_supervised_dataset,
+    fit_gravity_baseline,
+    fit_supervised_models,
+    make_forward_log_returns,
+    make_target_end_dates,
+    performance_table,
+)
 
 # --- Step 1: fetch and prep data ---
 # Expanded from 6 to 30 tickers across 7 sectors for meaningful cross-sectional IC.
@@ -59,6 +72,7 @@ plot_price_trends(prices, tickers=["AAPL", "MSFT"])
 # 2023-2024 = test  (out-of-sample, the honest IC)
 TRAIN_END = "2022-12-31"
 TEST_START = "2023-01-01"
+TEST_END = "2024-12-31"
 
 # Horizon pre-specified based on model design: momentum_lookback=240 (1-year signal),
 # so we evaluate at a 20-day forward horizon (standard medium-term check).
@@ -69,7 +83,22 @@ print(f"Test period:  {TEST_START} to {prices.index[-1].date()}")
 print(f"Horizon:      {HORIZON} days (pre-specified, not searched)")
 
 # Forward log-returns at the pre-specified horizon (log convention matches returns used in model)
-fwd = np.log(prices).diff(HORIZON).shift(-HORIZON)
+fwd = make_forward_log_returns(prices, horizon=HORIZON)
+target_end_dates = make_target_end_dates(prices.index, horizon=HORIZON)
+
+train_label_safe_dates = target_end_dates[
+    target_end_dates <= pd.Timestamp(TRAIN_END)
+].index
+test_label_safe_dates = target_end_dates[
+    (target_end_dates.index >= pd.Timestamp(TEST_START))
+    & (target_end_dates.index <= pd.Timestamp(TEST_END))
+    & (target_end_dates <= pd.Timestamp(TEST_END))
+].index
+
+print(
+    "Train IC/ML labels purged so target end date <= "
+    f"{pd.Timestamp(TRAIN_END).date()}"
+)
 
 # --- Step 5: Parameter search on TRAIN data only ---
 print("\n" + "="*60)
@@ -105,7 +134,9 @@ for config in param_configs:
     )
     # Evaluate IC only on train period
     ic_cfg = information_coefficient(
-        signals_cfg.loc[:TRAIN_END], fwd.loc[:TRAIN_END], method="spearman"
+        signals_cfg.loc[train_label_safe_dates],
+        fwd.loc[train_label_safe_dates],
+        method="spearman",
     )
     mean_ic = ic_cfg.mean()
     print(f"  -> Train IC: {mean_ic:.4f}")
@@ -142,10 +173,14 @@ print("  Skewness:", raw_signals.skew().mean())
 
 # Out-of-sample IC on raw gravity signal
 ic_test_raw = information_coefficient(
-    raw_signals.loc[TEST_START:], fwd.loc[TEST_START:], method="spearman"
+    raw_signals.loc[test_label_safe_dates],
+    fwd.loc[test_label_safe_dates],
+    method="spearman",
 )
 ic_train_raw = information_coefficient(
-    raw_signals.loc[:TRAIN_END], fwd.loc[:TRAIN_END], method="spearman"
+    raw_signals.loc[train_label_safe_dates],
+    fwd.loc[train_label_safe_dates],
+    method="spearman",
 )
 
 print(f"\nRaw gravity signal:")
@@ -193,13 +228,13 @@ port_returns_test = construct_portfolio(
 
 # Step P6: Evaluation — IC, ICIR, Sharpe
 metrics_train = evaluate_pipeline(
-    final_signal.loc[:TRAIN_END],
-    fwd.loc[:TRAIN_END],
+    final_signal.loc[train_label_safe_dates],
+    fwd.loc[train_label_safe_dates],
     port_returns_train,
 )
 metrics_test = evaluate_pipeline(
-    final_signal.loc[TEST_START:],
-    fwd.loc[TEST_START:],
+    final_signal.loc[test_label_safe_dates],
+    fwd.loc[test_label_safe_dates],
     port_returns_test,
 )
 
@@ -218,6 +253,87 @@ print(f"  Sharpe:          {metrics_test['sharpe']:.4f}")
 print(f"  Annual return:   {metrics_test['annual_return']:.4f}")
 print(f"  Annual vol:      {metrics_test['annual_vol']:.4f}")
 print(f"  Cumulative ret:  {metrics_test['cumulative_return']:.4f}")
+
+# =========================================================================
+# SUPERVISED REGRESSION MODEL
+# =========================================================================
+
+print("\n" + "="*60)
+print("SUPERVISED REGRESSION: Predict 20-day forward log return")
+print("="*60)
+
+supervised_dataset = build_supervised_dataset(
+    prices=prices,
+    returns=rets,
+    technical_features=feats,
+    gravity_signals=raw_signals,
+    volumes=vols,
+    horizon=HORIZON,
+    train_start="2020-01-01",
+    train_end=TRAIN_END,
+    test_start=TEST_START,
+    test_end=TEST_END,
+)
+
+train_dates = supervised_dataset.train.index.get_level_values("date")
+test_dates = supervised_dataset.test.index.get_level_values("date")
+
+print(f"\nSelected features ({len(supervised_dataset.feature_columns)}):")
+for feature_name in supervised_dataset.feature_columns:
+    print(f"  - {feature_name}")
+
+print("\nSupervised dataset dimensions:")
+print(
+    f"  Train rows x features: {supervised_dataset.X_train.shape} "
+    f"[{train_dates.min().date()} to {train_dates.max().date()}]"
+)
+print(
+    f"  Test rows x features:  {supervised_dataset.X_test.shape} "
+    f"[{test_dates.min().date()} to {test_dates.max().date()}]"
+)
+print(
+    "  Last train target end date: "
+    f"{supervised_dataset.train[TARGET_END_COLUMN].max().date()} "
+    "(purged to avoid overlap with test labels)"
+)
+
+gravity_baseline = fit_gravity_baseline(
+    supervised_dataset,
+    signal_column="gravity_signal",
+    horizon=HORIZON,
+)
+
+print("\nBaseline gravity performance (train-calibrated signal):")
+print(
+    performance_table([gravity_baseline]).to_string(
+        index=False,
+        float_format=lambda value: f"{value:.4f}",
+    )
+)
+
+try:
+    ml_results = fit_supervised_models(
+        supervised_dataset,
+        horizon=HORIZON,
+        ridge_alphas=(0.1, 1.0, 10.0, 100.0),
+        n_splits=3,
+        random_state=42,
+    )
+    all_supervised_results = [gravity_baseline] + ml_results
+    print("\nML regression performance:")
+    print(
+        performance_table(all_supervised_results).to_string(
+            index=False,
+            float_format=lambda value: f"{value:.4f}",
+        )
+    )
+    for result in ml_results:
+        if result.selected_params:
+            print(f"  Selected params for {result.name}: {result.selected_params}")
+except ImportError as exc:
+    print("\nML model training skipped:")
+    print(f"  {exc}")
+    print("  Install scikit-learn for Ridge/RandomForest; install xgboost to use XGBoost.")
 
 # Step P7: Visualisations — rolling IC, cumulative returns, IC histogram
 # Show train and test panels side-by-side for comparison

@@ -30,6 +30,21 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+class _IndicatorFrame(pd.DataFrame):
+    _metadata = ["_series_name_overrides"]
+
+    @property
+    def _constructor(self):
+        return _IndicatorFrame
+
+    def __getitem__(self, key):
+        result = super().__getitem__(key)
+        overrides = getattr(self, "_series_name_overrides", {})
+        if isinstance(result, pd.Series) and key in overrides:
+            return result.rename(overrides[key])
+        return result
+
+
 def calculate_moving_averages(data: pd.DataFrame, windows: list = [5, 10, 20, 50]) -> pd.DataFrame:
     """Calculate simple moving averages for given windows.
     
@@ -40,9 +55,12 @@ def calculate_moving_averages(data: pd.DataFrame, windows: list = [5, 10, 20, 50
     Returns:
         DataFrame with added MA columns
     """
-    df = data.copy()
+    df = _IndicatorFrame(data.copy())
+    df._series_name_overrides = {}
     for window in windows:
-        df[f'SMA_{window}'] = df['Close'].rolling(window=window).mean()
+        column = f'SMA_{window}'
+        df[column] = data['Close'].rolling(window=window).mean()
+        df._series_name_overrides[column] = data['Close'].name
     return df
 
 

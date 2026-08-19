@@ -1,0 +1,13 @@
+numpy
+pandas
+yfinance
+matplotlib
+seaborn
+dash
+plotly
+pytest
+scikit-learn
+pyarrow
+
+# Optional tree model. If omitted, supervised_regression.py uses RandomForestRegressor.
+# xgboost
