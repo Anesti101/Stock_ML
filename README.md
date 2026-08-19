@@ -31,6 +31,7 @@ Stock_ML/
 |-- Tests/
 |   |-- test_data_prep.py
 |   |-- test_dashboard.py
+|   |-- test_signal_pipeline.py
 |   `-- test_supervised_regression.py
 `-- README.md
 ```
@@ -62,6 +63,7 @@ The supervised split is chronological and purged:
 - Test prediction dates: 2023-01-01 through 2024-12-31.
 - Any train row whose 20-day target would finish after 2022-12-31 is dropped, so training labels do not use test-period returns.
 - Test rows are also dropped when the 20-day realised target is unavailable inside the supplied data.
+- Return winsorisation is causal: each date is capped using only that asset's prior observations, so 2023-2024 values cannot alter 2020-2022 transformed returns.
 - Ridge alpha selection uses purged expanding time-series validation inside the training set only.
 - The final 2023-2024 test set is used only once for final reporting.
 
@@ -81,7 +83,7 @@ Final metrics:
 - R2
 - Spearman rank correlation / Information Coefficient
 - ICIR
-- Ranked long-short portfolio Sharpe using predicted 20-day return rankings
+- Ranked long-short portfolio Sharpe formed from each date's predicted ranking and evaluated on actual next-day portfolio returns with standard daily annualisation
 
 ## Running The Project
 
@@ -121,6 +123,9 @@ The supervised tests check:
 - Train labels are purged when their 20-day target crosses into the test period.
 - Expanding validation folds purge label overlap.
 - Feature values at an as-of date do not change when only future prices are modified.
+- Causal winsorisation is unchanged when future/test-period values are shocked.
+- Bearish-regime signal rows remain flat after momentum blending.
+- All-zero or tied signal rows produce a flat portfolio position.
 
 ## Interview Framing
 

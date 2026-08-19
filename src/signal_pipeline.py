@@ -189,6 +189,11 @@ def combine_with_momentum(
 
     gravity_weight = 1.0 - momentum_weight
     combined = gravity_weight * rank_signal + momentum_weight * mom_rank
+    flat_rows = (
+        rank_signal.notna().any(axis=1)
+        & rank_signal.fillna(0.0).abs().sum(axis=1).eq(0.0)
+    )
+    combined.loc[flat_rows] = 0.0
     return combined
 
 
@@ -231,9 +236,21 @@ def construct_portfolio(
     port_daily = []
     dates = []
 
-    for dt in signal.index:
+    for idx_pos, dt in enumerate(signal.index):
+        if idx_pos + 1 >= len(signal.index):
+            continue
+        next_dt = signal.index[idx_pos + 1]
+
+        if next_dt not in rets.index:
+            continue
+
         sig_row = signal.loc[dt].dropna()
         if len(sig_row) < 4:
+            continue
+
+        if sig_row.nunique(dropna=True) < 2:
+            port_daily.append(0.0)
+            dates.append(next_dt)
             continue
 
         n = len(sig_row)
@@ -242,16 +259,6 @@ def construct_portfolio(
         sorted_sig = sig_row.sort_values()
         short_tickers = sorted_sig.iloc[:k].index        # bottom k
         long_tickers  = sorted_sig.iloc[-k:].index       # top k
-
-        # Next-day returns (shift already applied in the loop via tomorrow's row)
-        # We look up the *next* date's return to avoid look-ahead.
-        idx_pos = signal.index.get_loc(dt)
-        if idx_pos + 1 >= len(signal.index):
-            continue
-        next_dt = signal.index[idx_pos + 1]
-
-        if next_dt not in rets.index:
-            continue
 
         r_next = rets.loc[next_dt]
 

@@ -13,6 +13,7 @@ from supervised_regression import (  # noqa: E402
     TARGET_END_COLUMN,
     build_supervised_dataset,
     build_supervised_feature_panel,
+    evaluate_predictions,
     make_forward_log_returns,
     purged_expanding_time_series_splits,
 )
@@ -138,3 +139,58 @@ def test_purged_expanding_splits_do_not_overlap_validation_labels():
 
         assert train_fold.index.get_level_values("date").max() < val_start
         assert train_fold[TARGET_END_COLUMN].max() < val_start
+
+
+def test_evaluate_predictions_uses_next_day_returns_for_portfolio_sharpe():
+    dates = pd.bdate_range("2023-01-02", periods=4)
+    tickers = ["A", "B", "C", "D"]
+    index = pd.MultiIndex.from_product([dates, tickers], names=["date", "ticker"])
+    y_pred = pd.Series(
+        np.tile([0.1, 0.2, 0.3, 0.4], len(dates)),
+        index=index,
+        name="prediction",
+    )
+    y_true = pd.Series(
+        np.tile([1.0, -1.0, 1.0, -1.0], len(dates)),
+        index=index,
+        name=TARGET_COLUMN,
+    )
+    next_day_returns = pd.Series(
+        [
+            0.00,
+            0.01,
+            0.02,
+            0.04,
+            0.01,
+            0.00,
+            0.01,
+            0.02,
+            0.02,
+            0.01,
+            0.00,
+            -0.01,
+            -0.01,
+            0.00,
+            0.01,
+            0.03,
+        ],
+        index=index,
+        name="next_day_return",
+    )
+
+    metrics = evaluate_predictions(
+        y_true,
+        y_pred,
+        next_day_returns=next_day_returns,
+        top_pct=0.25,
+    )
+    expected_daily_returns = pd.Series([0.02, 0.005, -0.015, 0.02])
+    expected_sharpe = (
+        expected_daily_returns.mean() / expected_daily_returns.std() * np.sqrt(252)
+    )
+
+    assert np.isclose(
+        metrics["rank_portfolio_mean_daily_return"],
+        expected_daily_returns.mean(),
+    )
+    assert np.isclose(metrics["rank_portfolio_sharpe"], expected_sharpe)

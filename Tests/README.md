@@ -12,6 +12,7 @@ pytest Tests -q
 Tests/
 |-- test_data_prep.py              # Data fetching, validation, returns, features, saves
 |-- test_dashboard.py               # Dashboard indicator and chart helpers
+|-- test_signal_pipeline.py         # Regime and portfolio-construction safeguards
 |-- test_supervised_regression.py   # 20-day target and leakage controls
 `-- README.md
 ```
@@ -25,6 +26,13 @@ Tests/
 - Training rows are purged when their target horizon crosses into the test period.
 - Expanding validation folds purge label overlap.
 - Feature values at an as-of date are unchanged when only future prices are modified.
+- Supervised portfolio Sharpe uses next-day portfolio returns, not overlapping 20-day target observations.
+- Causal winsorisation is unchanged when future/test-period values are shocked.
+
+`test_signal_pipeline.py` verifies:
+
+- Bearish-regime rows that have been set flat remain zero after momentum blending.
+- All-zero or tied signal rows produce a flat/no-position portfolio result.
 
 ## Notes
 

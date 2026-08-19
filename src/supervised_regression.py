@@ -9,6 +9,7 @@ import pandas as pd
 
 TARGET_COLUMN = "future_return_20d"
 TARGET_END_COLUMN = "target_end_date"
+NEXT_DAY_RETURN_COLUMN = "next_day_return"
 
 
 @dataclass
@@ -21,6 +22,8 @@ class SupervisedDataset:
     feature_columns: list[str]
     target_column: str = TARGET_COLUMN
     target_end_column: str = TARGET_END_COLUMN
+    train_next_day_returns: pd.Series | None = None
+    test_next_day_returns: pd.Series | None = None
 
     @property
     def X_train(self) -> pd.DataFrame:
@@ -37,6 +40,14 @@ class SupervisedDataset:
     @property
     def y_test(self) -> pd.Series:
         return self.test[self.target_column]
+
+    @property
+    def next_day_train(self) -> pd.Series | None:
+        return self.train_next_day_returns
+
+    @property
+    def next_day_test(self) -> pd.Series | None:
+        return self.test_next_day_returns
 
 
 @dataclass
@@ -224,11 +235,13 @@ def infer_feature_columns(
     panel: pd.DataFrame,
     target_column: str = TARGET_COLUMN,
     target_end_column: str = TARGET_END_COLUMN,
+    next_day_return_column: str = NEXT_DAY_RETURN_COLUMN,
 ) -> list[str]:
     return [
         col
         for col in panel.columns
-        if col not in {target_column, target_end_column} and panel[col].notna().any()
+        if col not in {target_column, target_end_column, next_day_return_column}
+        and panel[col].notna().any()
     ]
 
 
@@ -326,7 +339,7 @@ def build_supervised_dataset(
         horizon=horizon,
     )
     feature_columns = infer_feature_columns(panel)
-    return chronological_train_test_split(
+    dataset = chronological_train_test_split(
         panel,
         train_start=train_start,
         train_end=train_end,
@@ -335,6 +348,13 @@ def build_supervised_dataset(
         feature_columns=feature_columns,
         purge_label_overlap=True,
     )
+    next_day_returns = _stack_wide(
+        returns.reindex_like(prices).shift(-1),
+        NEXT_DAY_RETURN_COLUMN,
+    )
+    dataset.train_next_day_returns = next_day_returns.reindex(dataset.train.index)
+    dataset.test_next_day_returns = next_day_returns.reindex(dataset.test.index)
+    return dataset
 
 
 def purged_expanding_time_series_splits(
@@ -462,26 +482,64 @@ def ranked_long_short_forward_returns(
     return pd.Series(returns, index=dates, name="ranked_long_short_forward_return")
 
 
+def ranked_long_short_next_day_returns(
+    scores: pd.Series,
+    next_day_returns: pd.Series,
+    *,
+    top_pct: float = 0.2,
+) -> pd.Series:
+    """Build daily long-short returns from each date's predicted ranking."""
+    if not 0.0 < top_pct < 0.5:
+        raise ValueError("top_pct must be in (0, 0.5)")
+
+    paired = _valid_pair_frame(next_day_returns, scores)
+    returns: list[float] = []
+    dates: list[pd.Timestamp] = []
+
+    for dt, group in paired.groupby(level="date"):
+        if len(group) < 4:
+            continue
+        if group["predicted"].nunique(dropna=True) < 2:
+            returns.append(0.0)
+            dates.append(dt)
+            continue
+
+        k = max(1, int(np.floor(len(group) * top_pct)))
+        ranked = group.sort_values("predicted")
+        short_leg = ranked.iloc[:k]["actual"].mean()
+        long_leg = ranked.iloc[-k:]["actual"].mean()
+        returns.append(float(0.5 * long_leg - 0.5 * short_leg))
+        dates.append(dt)
+
+    return pd.Series(returns, index=dates, name="ranked_long_short_next_day_return")
+
+
 def evaluate_predictions(
     y_true: pd.Series,
     y_pred: pd.Series,
     *,
+    next_day_returns: pd.Series | None = None,
     horizon: int = 20,
     top_pct: float = 0.2,
     trading_days_per_year: int = 252,
 ) -> dict[str, float]:
     metrics = regression_metrics(y_true, y_pred)
     ic = daily_information_coefficient(y_pred, y_true, method="spearman")
-    portfolio_returns = ranked_long_short_forward_returns(
-        y_pred, y_true, top_pct=top_pct
-    )
+    if next_day_returns is None:
+        portfolio_returns = pd.Series(dtype=float, name="ranked_long_short_next_day_return")
+    else:
+        portfolio_returns = ranked_long_short_next_day_returns(
+            y_pred,
+            next_day_returns,
+            top_pct=top_pct,
+        )
 
     mean_ic = float(ic.mean()) if len(ic) else np.nan
     icir = float(mean_ic / (ic.std() + 1e-12)) if len(ic) else np.nan
     mean_port = float(portfolio_returns.mean()) if len(portfolio_returns) else np.nan
     vol_port = float(portfolio_returns.std()) if len(portfolio_returns) else np.nan
     sharpe = (
-        float(mean_port / (vol_port + 1e-12) * np.sqrt(trading_days_per_year / horizon))
+        float(mean_port / (vol_port + 1e-12) * np.sqrt(trading_days_per_year))
         if len(portfolio_returns)
         else np.nan
     )
@@ -491,7 +549,8 @@ def evaluate_predictions(
             "mean_ic": mean_ic,
             "icir": icir,
             "rank_portfolio_sharpe": sharpe,
-            "rank_portfolio_mean_forward_return": mean_port,
+            "rank_portfolio_mean_daily_return": mean_port,
+            "n_portfolio_days": float(len(portfolio_returns)),
             "n_obs": float(len(_valid_pair_frame(y_true, y_pred))),
             "n_ic_dates": float(len(ic)),
         }
@@ -535,8 +594,18 @@ def fit_gravity_baseline(
         name="gravity_baseline",
         train_predictions=train_pred,
         test_predictions=test_pred,
-        train_metrics=evaluate_predictions(dataset.y_train, train_pred, horizon=horizon),
-        test_metrics=evaluate_predictions(dataset.y_test, test_pred, horizon=horizon),
+        train_metrics=evaluate_predictions(
+            dataset.y_train,
+            train_pred,
+            next_day_returns=dataset.next_day_train,
+            horizon=horizon,
+        ),
+        test_metrics=evaluate_predictions(
+            dataset.y_test,
+            test_pred,
+            next_day_returns=dataset.next_day_test,
+            horizon=horizon,
+        ),
         estimator={"intercept": float(intercept), "slope": float(slope)},
         selected_params={"signal_column": signal_column},
     )
@@ -686,10 +755,16 @@ def fit_supervised_models(
                 train_predictions=train_pred,
                 test_predictions=test_pred,
                 train_metrics=evaluate_predictions(
-                    dataset.y_train, train_pred, horizon=horizon
+                    dataset.y_train,
+                    train_pred,
+                    next_day_returns=dataset.next_day_train,
+                    horizon=horizon,
                 ),
                 test_metrics=evaluate_predictions(
-                    dataset.y_test, test_pred, horizon=horizon
+                    dataset.y_test,
+                    test_pred,
+                    next_day_returns=dataset.next_day_test,
+                    horizon=horizon,
                 ),
                 estimator=estimator,
                 selected_params=selected_params,
@@ -709,7 +784,8 @@ def performance_table(results: Sequence[PredictionResult]) -> pd.DataFrame:
         "mean_ic",
         "icir",
         "rank_portfolio_sharpe",
-        "rank_portfolio_mean_forward_return",
+        "rank_portfolio_mean_daily_return",
+        "n_portfolio_days",
         "n_obs",
         "n_ic_dates",
     ]
