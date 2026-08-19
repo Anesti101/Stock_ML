@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python src/main.py)",
+      "Bash(python -c \"import signal_pipeline; print\\(''import OK''\\); print\\(dir\\(signal_pipeline\\)\\)\")"
+    ]
+  }
+}

@@ -1,0 +1,485 @@
+================================================================================
+CHANGELOG — Stock_ML
+================================================================================
+Format: [DATE] FILE — CHANGE — WHY
+================================================================================
+
+--------------------------------------------------------------------------------
+2026-03-27 | gravity_model.py + main.py
+Reason for session: Fix inflated/inaccurate IC of 0.316
+--------------------------------------------------------------------------------
+
+[2026-03-27] gravity_model.py
+  CHANGE: Added `import logging`, `import warnings`, and
+          `logger = logging.getLogger(__name__)` at top of file.
+  WHY:    `logger.warning(...)` was called on lines 301 and 308 but `logger`
+          was never defined in this module. This would raise a NameError at
+          runtime any time volume or market_caps was missing. The fix adds the
+          logger so the module is importable and runnable without crashing.
+
+[2026-03-27] gravity_model.py
+  CHANGE: Replaced `logger.warning(...)` calls (lines 301, 308) with
+          `warnings.warn(...)`.
+  WHY:    Since gravity_model.py had no logging configuration of its own,
+          using the stdlib `warnings` module is simpler and doesn't require
+          a logger to be configured by the caller. Functionally equivalent
+          for alerting the user to a bad argument combination.
+
+[2026-03-27] gravity_model.py
+  CHANGE: Fixed `compute_masses(..., method=mass_method)` → `method=chosen_method`.
+  WHY:    The pipeline computed `chosen_method` as a fallback (e.g. switching
+          from "dollar_volume" to "equal" when volume is None), but then passed
+          the original `mass_method` to `compute_masses` instead. This meant
+          the fallback logic was silently ignored — `compute_masses` would still
+          receive "dollar_volume" and crash on missing volume. Now `chosen_method`
+          is actually used, making the fallback work as intended.
+
+[2026-03-27] gravity_model.py
+  CHANGE: Fixed typo `massess = masses.ffill().bfill()` → `masses = masses.ffill().bfill()`.
+  WHY:    The double-s typo (`massess`) caused the forward/back-filled masses to
+          be assigned to a new variable that was never referenced again. The
+          pipeline then used the original un-filled `masses` in the date loop,
+          meaning early dates with sparse volume data had NaN or floored masses,
+          producing noisy signals. The fix ensures the filled masses are actually
+          used downstream.
+
+[2026-03-27] gravity_model.py
+  CHANGE: Removed walrus operator from `m.fillna(median := np.nanmedian(m.values))`
+          → `m.fillna(np.nanmedian(m.values))`.
+  WHY:    The walrus operator assigned the median to a variable `median` that
+          was never used anywhere. Inlining it removes a lint warning and
+          makes the line cleaner with no behaviour change.
+
+[2026-03-27] gravity_model.py
+  CHANGE: Removed duplicate line `signal_df = pd.DataFrame(signals).T`
+          (the commented-out version on line 363).
+  WHY:    The line immediately below it overwrote signal_df with the same
+          construction plus `.reindex(...)`. The first assignment was dead code —
+          it was never read before being replaced. Removed to avoid confusion.
+
+[2026-03-27] main.py
+  CHANGE: Removed `signals = signals * -1` (post-hoc signal inversion).
+  WHY:    The inversion was applied after running the model and observing that
+          the IC was negative. Choosing the signal sign by looking at the outcome
+          is a form of hindsight bias in signal design — it guarantees a positive
+          IC without any theoretical justification. The IC should reflect whatever
+          direction the model naturally produces.
+
+[2026-03-27] main.py
+  CHANGE: Removed the 11-horizon search loop and `best_k = max(results, ...)`.
+          Replaced with a single pre-specified `HORIZON = 20`.
+  WHY:    Testing 11 horizons on the same data and reporting the best IC is
+          multiple-comparison bias. Even a random signal will produce a high IC
+          on the best of 11 tries. A legitimate evaluation requires the horizon
+          to be fixed before any data is examined. HORIZON=20 was chosen based
+          on the model design (medium-term momentum), not by searching the data.
+
+[2026-03-27] main.py
+  CHANGE: Added a train/test split: TRAIN_END="2022-12-31", TEST_START="2023-01-01".
+          Parameter search runs only on train data. Final IC is reported only
+          on the held-out test period (2023-2024).
+  WHY:    All prior evaluation was in-sample — the model was tuned and evaluated
+          on the same data. This inflates IC because the model can inadvertently
+          fit to noise in the evaluation period. Holding out 2023-2024 as unseen
+          data means the reported IC reflects genuine predictive ability, not
+          memorisation of the training set.
+
+[2026-03-27] main.py
+  CHANGE: Parameter tuning loop now evaluates `ic_cfg` on `.loc[:TRAIN_END]`
+          only, and reports both Train IC (reference) and Test IC (honest result)
+          at the end.
+  WHY:    Previously the parameter configs were tested on the full dataset and
+          the best config was selected based on full-period IC. This is the same
+          as training and testing on the same data. Now the best config is chosen
+          purely from training data, and the test IC is only computed once at
+          the very end using the winning config — matching standard ML practice.
+
+--------------------------------------------------------------------------------
+2026-03-27 | gravity_model.py + main.py
+Reason for session: Improve model signal quality and cross-sectional coverage
+--------------------------------------------------------------------------------
+
+[2026-03-27] gravity_model.py — net_force_signal()
+  CHANGE: Replaced `np.sign(mom_vec)` with `mom_vec` in both the Series and
+          DataFrame branches of net_force_signal.
+  WHY:    sign() collapses the momentum value to -1, 0, or +1, throwing away
+          magnitude information. A stock with z-score momentum of 2.5 was
+          treated the same as one with 0.01. Using the actual z-scored value
+          means stronger-momentum assets exert proportionally more directional
+          pull on the gravity force, making the signal more informative.
+
+[2026-03-27] gravity_model.py — gravity_signals_pipeline()
+  CHANGE: Added two new parameters: `reversal_lookback: Optional[int] = None`
+          and `reversal_weight: float = 0.3`. When reversal_lookback is set,
+          a short-term momentum signal at that lookback is computed and
+          subtracted (weighted by reversal_weight) from the long-term momentum
+          direction before the gravity force is applied:
+              direction = long_mom - reversal_weight * short_mom
+  WHY:    Short-term price reversal (1–5 day) is a well-documented anomaly:
+          stocks that spike in the past few days tend to mean-revert. Without
+          this, the model's directional pull is biased toward recent runners
+          that are actually about to reverse. Subtracting the reversal
+          component makes the combined direction signal more predictive.
+
+[2026-03-27] main.py — tickers list
+  CHANGE: Expanded from 6 tickers (all mega-cap tech) to 30 tickers across
+          7 sectors: Tech, Financials, Healthcare, Consumer, Energy,
+          Industrials, Media/Entertainment.
+  WHY:    Cross-sectional IC is computed across assets on each date. With 6
+          stocks, each daily IC value is a correlation over only 6 data points
+          — extremely noisy and unreliable. With 30 diversified stocks the
+          IC is computed over 30 points per day, is more stable, and captures
+          genuine cross-sectional variation rather than noise. Sector diversity
+          also ensures the distance matrix has meaningful variance (the old
+          6 mega-cap tech stocks were all highly correlated, making their
+          distances nearly uniform and uninformative).
+
+[2026-03-27] main.py — param_configs
+  CHANGE: Added reversal_lookback=5 to all parameter configs, and added a
+          baseline config without reversal (reversal_lookback=None) for
+          comparison.
+  WHY:    5-day reversal is the standard short-term window in the academic
+          literature. Including it as a parameter to tune lets the search
+          confirm (or reject) whether reversal improves train IC. The baseline
+          config without reversal allows direct comparison of the improvement.
+
+--------------------------------------------------------------------------------
+2026-03-27 | data_prep.py + eda.py + gravity_model.py + main.py
+Reason for session: Iterative bug-fix, dead-code removal, and correctness pass
+--------------------------------------------------------------------------------
+
+[2026-03-27] data_prep.py — prepare_price_data()
+  CHANGE: Removed the first unconditional call to fetch_volumes_yfinance() (lines
+          392-393 before the try/except block). The try/except block immediately
+          below already fetches volumes with proper error handling; the first call
+          was redundant and its result was silently discarded by the second.
+  WHY:    If the first call succeeded but the second failed (e.g. transient network
+          error), the working volumes were thrown away and replaced with an empty
+          DataFrame, corrupting downstream dollar-volume mass computation.
+
+[2026-03-27] data_prep.py — fetch_prices_yfinance()
+  CHANGE: Removed dead variable `field = "Adj Close" if auto_adjust else "Close"`.
+          The function already uses the preferred/fallback pattern below it; `field`
+          was assigned but never read.
+  WHY:    Dead assignment caused a pylint "unused variable" warning and was
+          misleading — it implied the variable was being used for field selection
+          when it was not.
+
+[2026-03-27] data_prep.py — add_technical_features()
+  CHANGE: Removed the intermediate feat_df = pd.concat(...) + new_cols loop block
+          (lines 303-316). Those lines built a DataFrame and a list that were both
+          immediately overwritten by the pieces/concat block that follows.
+  WHY:    The first pd.concat and the new_cols loop were dead code — neither result
+          was ever used. Removing them avoids a redundant O(n) concat and the
+          confusing comment "The above builds names but we need to rebuild...".
+
+[2026-03-27] data_prep.py — winsorize_outliers()
+  CHANGE: Fixed comment typo "per column maan" → "per column mean".
+  WHY:    Cosmetic correctness.
+
+[2026-03-27] eda.py — missingness_report()
+  CHANGE: Removed the unreachable duplicate function body (lines 88-113) that
+          appeared after the `return` statement.
+  WHY:    Code after a return is never executed. The duplicate block was a copy of
+          the live body above it (with a minor structural difference) and silently
+          dead. Leaving it risked future maintainers editing the dead copy and
+          believing they had changed the function's behaviour.
+
+[2026-03-27] gravity_model.py — _zscore_by_row()
+  CHANGE: Replaced `sigma.replace(0, np.nan) + eps` with `sigma + eps` as the
+          denominator.
+  WHY:    `replace(0, np.nan)` converted zero-std rows to NaN, then adding eps
+          to NaN is still NaN, so the intended epsilon floor was never applied.
+          The result was that any date where all assets had identical signals
+          (std=0) produced a row of NaN in the output instead of zeros. With
+          `sigma + eps` directly, zero-std rows produce (x - mu) / eps ≈ 0,
+          which is the correct degenerate output.
+
+[2026-03-27] gravity_model.py — compute_masses()
+  CHANGE: Added "equal" as a valid method: `if method not in {"market_cap",
+          "dollar_volume", "equal"}`. The else-branch assigns
+          `pd.DataFrame(1.0, index=prices.index, columns=prices.columns)`.
+  WHY:    gravity_signals_pipeline() falls back to chosen_method="equal" when
+          volume or market_caps are missing, but compute_masses raised ValueError
+          for any method outside {"market_cap", "dollar_volume"}. This made the
+          fallback path crash instead of gracefully using unit masses. The fix
+          makes the pipeline's own fallback logic actually work.
+
+[2026-03-27] gravity_model.py — correlation_distance()
+  CHANGE: Replaced `end_loc = returns.index.get_loc(dt)` inside the date loop
+          with `for end_loc, dt in enumerate(returns.index)`.
+  WHY:    pandas Index.get_loc() is O(n) for non-sorted or non-hash-indexed
+          DatetimeIndex lookups. Called once per date over a multi-year daily
+          panel (~1250 dates), this was O(n²) total. Using enumerate() provides
+          the positional integer directly at O(1), making the loop O(n).
+
+[2026-03-27] gravity_model.py — net_force_signal() docstring
+  CHANGE: Updated docstring line from "sum_j F_ij * sign(momentum_j)" to
+          "sum_j F_ij * momentum_j" to reflect the actual implementation.
+  WHY:    The sign() description was left over from before the prior session
+          replaced np.sign() with actual momentum values. A misleading docstring
+          describing a discarded implementation is worse than no docstring.
+
+[2026-03-27] gravity_model.py — gravity_signals_pipeline()
+  CHANGE: Fixed typo in inline comment "missing momemtum" → "missing momentum".
+  WHY:    Cosmetic correctness.
+
+[2026-03-27] main.py
+  CHANGE: Added `import numpy as np` to imports.
+  WHY:    The forward-returns line `fwd = np.log(prices).diff(HORIZON).shift(-HORIZON)`
+          uses np.log, but numpy was not imported. This would raise NameError at
+          runtime.
+
+[2026-03-27] main.py
+  CHANGE: Changed forward-returns computation from
+          `prices.pct_change(HORIZON).shift(-HORIZON)` (simple returns) to
+          `np.log(prices).diff(HORIZON).shift(-HORIZON)` (log returns).
+  WHY:    The model uses log returns throughout (data_prep returns log returns,
+          momentum is computed as log price differences). Computing the IC between
+          a log-return-based signal and simple forward returns creates a systematic
+          asymmetry. Log returns are also more symmetric and better behaved for
+          rank-correlation (Spearman IC), particularly for multi-day horizons where
+          compounding makes simple returns positively skewed.
+
+--------------------------------------------------------------------------------
+2026-03-31 | data_prep.py + gravity_model.py
+Reason for session: Second iterative improvement pass — API efficiency, correctness of winsorization, vectorisation of correlation loop, and simplification of masses lookup
+--------------------------------------------------------------------------------
+
+[2026-03-31] data_prep.py — _fetch_prices_and_volumes() (new private helper)
+  CHANGE: Added private helper `_fetch_prices_and_volumes(tickers, start, end,
+          interval, progress)` that calls `yf.download()` once and returns
+          `(prices_df, volumes_df)`. The helper follows the same Adj Close /
+          Close fallback logic as `fetch_prices_yfinance` and the Volume
+          extraction logic of `fetch_volumes_yfinance`.
+  WHY:    `prepare_price_data` previously issued two separate `yf.download()`
+          calls — one for prices, one for volumes — doubling the network
+          round-trips and risking mismatched data if Yahoo's response differed
+          between calls. yfinance returns all OHLCV fields in a single download;
+          there is no reason to fetch them separately. The new helper halves the
+          API calls without changing any public function signatures.
+
+[2026-03-31] data_prep.py — prepare_price_data()
+  CHANGE: Replaced the two sequential fetch calls (`fetch_prices_yfinance` then
+          `fetch_volumes_yfinance`) with a single call to the new private helper
+          `_fetch_prices_and_volumes`. Added a try/except fallback that retries
+          with `fetch_prices_yfinance` (prices only, empty volumes) if the
+          combined fetch raises any exception.
+  WHY:    Directly implements Target 1: one download instead of two. The
+          backward-compatible fallback preserves the previous behaviour if the
+          combined download fails for any unexpected reason.
+
+[2026-03-31] data_prep.py — prepare_price_data()
+  CHANGE: Removed `winsorize_outliers(prices, z_thresh=winsorize_z)` applied
+          to price levels. Added `winsorize_outliers(returns, z_thresh=winsorize_z)`
+          applied to the log-returns after `compute_returns()`.
+  WHY:    Winsorizing non-stationary price levels and then computing log-returns
+          creates artificial discontinuities: wherever a price was clipped the
+          resulting return is a spurious spike or dip that has no counterpart in
+          the original data. Returns are already stationary, making them the
+          correct target for outlier capping. This is standard practice in
+          quantitative finance (e.g. AQR, MSCI risk model construction).
+
+[2026-03-31] gravity_model.py — correlation_distance()
+  CHANGE: Replaced the Python `for end_loc, dt in enumerate(returns.index)` loop
+          that called `window_slice.corr()` on every date with a single call to
+          `returns.rolling(window=window, min_periods=min_periods).corr()` (pandas
+          C backend). The subsequent loop only groups by date and converts the
+          already-computed correlation block to a distance matrix.
+  WHY:    The old loop was the single biggest performance bottleneck: for a panel
+          of p assets over n dates, it performed n separate O(p²) correlation
+          computations in Python. The vectorised rolling corr uses pandas' Cython
+          backend, runs in a fraction of the time, and is numerically identical.
+          The result dict structure and distance formula are unchanged.
+
+[2026-03-31] gravity_model.py — gravity_signals_pipeline()
+  CHANGE: Replaced `masses.loc[:dt].iloc[-1].reindex(dist.index, fill_value=0.0)`
+          with `masses.loc[dt].reindex(dist.index, fill_value=0.0)` inside the
+          date loop.
+  WHY:    After `masses.ffill().bfill()`, the masses DataFrame is fully indexed to
+          `prices.index` with no NaN values. Every `dt` from `dist_mats` is also
+          in `prices.index`. The `.loc[:dt].iloc[-1]` pattern performed an
+          unnecessary full up-to-date slice on every iteration before selecting
+          the last row, which is O(n) per iteration (O(n²) total). Direct
+          `.loc[dt]` is O(1) and returns the same value.
+
+--------------------------------------------------------------------------------
+2026-03-31 | data_prep.py + gravity_model.py
+Reason for session: Third iterative pass — fix newly introduced bugs, dead code, and stale docstring
+--------------------------------------------------------------------------------
+
+[2026-03-31] data_prep.py — _fetch_prices_and_volumes() single-ticker volume path
+  CHANGE: Replaced
+            `df.rename(columns={"Volume": only})[["Volume"]].rename(columns={"Volume": only})`
+          with
+            `df[["Volume"]].rename(columns={"Volume": only})`
+  WHY:    The previous code renamed "Volume" to the ticker name, then immediately
+          tried to select column "Volume" from the result — which no longer existed
+          since it had just been renamed. This would raise a KeyError for any
+          single-ticker download. The fix selects "Volume" first, then renames once.
+
+[2026-03-31] data_prep.py — _fetch_prices_and_volumes() dead mask variable
+  CHANGE: Removed `mask = ~frame.index.duplicated(keep="first")` from inside the
+          loop body, and removed the now-unnecessary comment above it.
+  WHY:    `mask` was assigned but never used — the deduplication was already
+          being done correctly below the loop by reassigning `prices` and `volumes`.
+          The unused assignment was misleading dead code.
+
+[2026-03-31] data_prep.py — prepare_price_data() docstring
+  CHANGE: Updated docstring to reflect the current pipeline order: fetch → validate
+          → align/fill → compute returns → (optional) winsorize returns → features.
+          The previous docstring still described the old order (winsorize prices
+          before computing returns).
+  WHY:    Stale docstrings create confusion about what the function actually does.
+
+[2026-03-31] gravity_model.py — imports
+  CHANGE: Removed `Tuple` from `from typing import Optional, Tuple, Dict`.
+  WHY:    `Tuple` was imported but never used anywhere in the file after previous
+          clean-up passes. Unused imports add noise to the module's dependency list.
+
+[2026-03-31] gravity_model.py — gravity_force_matrix() DataFrame squeeze
+  CHANGE: Removed the always-True `if masses.ndim == 2:` guard inside
+          `if isinstance(masses, pd.DataFrame):`. The shape checks now run
+          directly under the isinstance guard.
+  WHY:    `DataFrame.ndim` is always 2 by definition — the inner `if` was
+          unconditionally entered whenever the outer isinstance check was True,
+          making it dead logic that misled readers into thinking there was a
+          meaningful branch condition.
+
+[2026-03-31] gravity_model.py — gravity_signals_pipeline() momentum lookup
+  CHANGE: Replaced `mom.reindex(index=[dt]).iloc[0].reindex(F_t.columns).fillna(0.0)`
+          with `mom.loc[dt].reindex(F_t.columns).fillna(0.0)`.
+  WHY:    `mom` is indexed to `prices.index` and every `dt` from `dist_mats` is
+          in that index. The old pattern constructed a 1-row DataFrame via
+          `reindex(index=[dt])` then extracted the single row via `.iloc[0]` —
+          an unnecessary intermediate allocation per iteration. `mom.loc[dt]`
+          returns the same Series directly in O(1).
+
+--------------------------------------------------------------------------------
+2026-03-31 | main.py + gravity_model.py + eda.py + data_prep.py
+Reason for session: Fix runtime crashes and warnings found by actually running main.py
+--------------------------------------------------------------------------------
+
+[2026-03-31] main.py — print() encoding crash
+  CHANGE: Replaced `"  → Train IC: ..."` with `"  -> Train IC: ..."`.
+  WHY:    The Unicode arrow U+2192 cannot be encoded in the Windows cp1252 console
+          code page, causing UnicodeEncodeError and terminating the script before
+          any parameter search results were printed.
+
+[2026-03-31] gravity_model.py — gravity_signals_pipeline() min_periods guard
+  CHANGE: Added `effective_min_periods = min(dist_min_periods, dist_window)` and
+          pass that to correlation_distance instead of dist_min_periods directly.
+  WHY:    pandas raises ValueError when min_periods > window in rolling().corr().
+          The old Python-loop implementation silently returned an empty dict when
+          min_periods > window (all dates were skipped); the vectorised version
+          crashes immediately. Clamping to dist_window restores the graceful
+          behaviour: configs like {dist_window=20, dist_min_periods=30} now
+          produce signals starting from when dist_window observations are available,
+          rather than crashing.
+
+[2026-03-31] gravity_model.py — information_coefficient() RuntimeWarning
+  CHANGE: Wrapped the per-date `x_rank.corr(y_rank)` / `x.corr(y)` calls with
+          `np.errstate(invalid="ignore", divide="ignore")`.
+  WHY:    When a stock has all-tied ranks on a given date (zero standard deviation),
+          numpy's corrcoef divides by zero and emits a RuntimeWarning. The NaN
+          result is already correctly handled by the `pd.notna(val)` guard below.
+          The warning was expected and benign but cluttered the output across every
+          date in the 5-config parameter search.
+
+[2026-03-31] eda.py — quick_eda_summary() RuntimeWarning
+  CHANGE: Wrapped `returns.corr()` with `np.errstate(invalid="ignore", divide="ignore")`.
+  WHY:    Same root cause as above. pandas DataFrame.corr() calls numpy's corrcoef
+          internally; when any return column has near-zero variance, it emits the
+          same divide-by-zero RuntimeWarning. Suppressed because NaN correlations
+          are the expected result for such columns.
+
+[2026-03-31] main.py — best config selection
+  CHANGE: Changed `if best_train_ic is None or abs(mean_ic) > abs(best_train_ic):`
+          to `if best_train_ic is None or mean_ic > best_train_ic:`.
+  WHY:    The old logic selected the config with the highest absolute IC, which
+          would prefer a large-negative IC over a small-positive one. Since the
+          signal is used as-is (no automatic sign flip), picking the most positive
+          IC is correct. Selecting a strongly negative IC as "best" and then using
+          the signal without inversion produces a backwards predictor.
+
+[2026-03-31] data_prep.py — logger.info arrow character
+  CHANGE: Replaced `"Final shapes -> prices:..."` with `"Final shapes - prices:..."`.
+  WHY:    The `->` in logger.info was displaying as `\u2192` in the cp1252 Windows
+          terminal because the logging handler writes directly to stderr without
+          going through Python's print() encoding path.
+
+--------------------------------------------------------------------------------
+2026-03-31 | signal_pipeline.py (NEW) + main.py
+Reason for session: Implement full 7-step post-processing pipeline for gravity signals
+--------------------------------------------------------------------------------
+
+[2026-03-31] signal_pipeline.py — CREATED
+  CHANGE: New module with 7 pipeline steps as standalone functions:
+          volatility_scale, cross_sectional_rank, regime_filter,
+          combine_with_momentum, construct_portfolio, evaluate_pipeline,
+          plot_pipeline_results.
+  WHY:    Raw gravity signals are z-scored but not regime-aware or vol-adjusted.
+          Adding vol scaling, cross-sectional ranking, a bearish-regime filter,
+          and a momentum blend provides a more complete, deployable signal.
+          Separating into a module keeps main.py readable and each function
+          independently testable.
+
+[2026-03-31] signal_pipeline.py — volatility_scale()
+  CHANGE: Divides raw signal by rolling 20-day std of returns (shifted 1 day).
+  WHY:    Signal magnitude relative to vol is what drives risk-adjusted returns.
+          A large signal during a low-vol period is more meaningful than the
+          same signal during a crash. Shifting returns by 1 day prevents
+          look-ahead bias (today's vol is not known until today's close).
+
+[2026-03-31] signal_pipeline.py — cross_sectional_rank()
+  CHANGE: Converts each row (date) to percentile ranks in [0, 1] using
+          pandas rank(pct=True).
+  WHY:    Ranking neutralises outliers and makes the signal units-invariant.
+          It is equivalent to transforming into a uniform distribution, which
+          helps the long-short portfolio construction step.
+
+[2026-03-31] signal_pipeline.py — regime_filter()
+  CHANGE: Zeros out all signals on days when MA50 <= MA200 (bearish regime),
+          using equal-weighted average price as the default benchmark.
+  WHY:    Long-short momentum strategies historically underperform in bear
+          markets (momentum crashes). Flat-positioning during drawdown periods
+          can improve Sharpe without large IC cost.
+
+[2026-03-31] signal_pipeline.py — combine_with_momentum()
+  CHANGE: Blends gravity rank (70%) with 60-day cumulative-return momentum
+          rank (30%). Momentum is also shifted 1 day to avoid look-ahead.
+  WHY:    Both gravity and momentum signals have documented positive IC.
+          Combining two independently-positive signals reduces variance of
+          the combined IC (diversification benefit).
+
+[2026-03-31] signal_pipeline.py — construct_portfolio()
+  CHANGE: Long top 20%, short bottom 20% by signal rank on each day.
+          Returns are from the *next* date to avoid look-ahead bias.
+          Each leg equally weighted; portfolio is dollar-neutral.
+  WHY:    Standard long-short equity construction; directly computable
+          Sharpe makes the signal actionable and benchmarkable.
+
+[2026-03-31] signal_pipeline.py — evaluate_pipeline()
+  CHANGE: Computes IC, ICIR, annualised Sharpe, annual return, annual vol,
+          and cumulative log-return for any signal/portfolio pair.
+  WHY:    Single evaluation function used for both train and test periods
+          so results are comparable and consistently computed.
+
+[2026-03-31] signal_pipeline.py — plot_pipeline_results()
+  CHANGE: Three-panel figure: 60-day rolling IC, cumulative portfolio returns,
+          IC distribution histogram. One call per period (train / test).
+  WHY:    Requested visualisations; three panels in one figure avoids
+          window proliferation and makes the diagnostics easy to compare.
+
+[2026-03-31] main.py
+  CHANGE: Added imports from signal_pipeline; renamed gravity output to
+          raw_signals; inserted pipeline steps P1-P7 after the existing
+          gravity evaluation; kept all original gravity IC prints intact.
+  WHY:    Pipeline steps are additive — original gravity IC numbers are
+          preserved as a baseline. The new section shows whether the
+          post-processing steps improve IC, ICIR, and Sharpe on the
+          out-of-sample test period.
+
+================================================================================
+END OF CHANGELOG
+================================================================================

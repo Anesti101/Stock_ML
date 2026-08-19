@@ -1,8 +1,12 @@
 
 from __future__ import annotations
-from typing import Optional, Tuple, Dict
+import logging
+import warnings
+from typing import Optional, Dict
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------
 # Utility helpers
@@ -25,8 +29,8 @@ def _zscore_by_row(df: pd.DataFrame, eps: float = 1e-12) -> pd.DataFrame:
     mu = df.mean(axis=1)
     # compute row stds
     sigma = df.std(axis=1)
-    # broadcast-normalise with small epsilon
-    return (df.sub(mu, axis=0)).div(sigma.replace(0, np.nan) + eps, axis=0)
+    # broadcast-normalise; eps floors the denominator so zero-std rows yield 0 rather than NaN
+    return (df.sub(mu, axis=0)).div(sigma + eps, axis=0)
 
 
 # ---------------------------------------------------------------------
@@ -56,15 +60,15 @@ def compute_masses(
         Heavier assets should pull more. Market cap or liquidity are sensible, explainable proxies.
     """
     # defensive coercion
-    if method not in {"market_cap", "dollar_volume"}:
-        raise ValueError("method must be 'market_cap' or 'dollar_volume'")
+    if method not in {"market_cap", "dollar_volume", "equal"}:
+        raise ValueError("method must be 'market_cap', 'dollar_volume', or 'equal'")
 
     if method == "market_cap":
         # require market_caps to be provided
         if market_caps is None:
             raise ValueError("market_caps must be provided when method='market_cap'")
         masses = market_caps.copy()  # copy to avoid mutating caller data
-    else:
+    elif method == "dollar_volume":
         # dollar volume requires volume
         if volume is None:
             raise ValueError("volume must be provided when method='dollar_volume'")
@@ -72,6 +76,9 @@ def compute_masses(
         dollar_vol = prices * volume
         # average over a rolling window to smooth noise
         masses = dollar_vol.rolling(roll_window, min_periods=max(2, roll_window // 3)).mean()
+    else:
+        # equal mass: every asset has weight 1.0 at every date
+        masses = pd.DataFrame(1.0, index=prices.index, columns=prices.columns)
 
     # replace non-positive/NaN masses with a tiny floor to keep formulas stable
     masses = masses.fillna(min_mass).clip(lower=min_mass)
@@ -102,26 +109,25 @@ def correlation_distance(
     # Container for per-date distance matrices
     out: Dict[pd.Timestamp, pd.DataFrame] = {}
 
-    # rolling correlation per date across the asset panel
-    # We iterate across dates to keep memory moderate & retain clarity.
-    for dt in returns.index:
-        # select trailing window up to 'dt'
-        end_loc = returns.index.get_loc(dt)
-        start_loc = max(0, end_loc - window + 1)
-        # slice window
-        window_slice = returns.iloc[start_loc:end_loc + 1]
-        # require enough periods to compute correlations meaningfully
-        if len(window_slice) < min_periods:
-            continue
-        # compute correlation across assets for the window
-        corr = window_slice.corr()
-        # ensure same order/index/columns
-        corr = corr.reindex(index=tickers, columns=tickers)
+    # Compute ALL pairwise rolling correlations in one vectorised call using
+    # pandas' C backend. This avoids the O(n * p^2) Python loop that called
+    # window_slice.corr() on every single date.
+    # Suppress the divide-by-zero warning that fires when a stock has zero
+    # variance in a window — the resulting NaN is handled by fillna(0.0) below.
+    with np.errstate(invalid="ignore", divide="ignore"):
+        rolling_corr = returns.rolling(window=window, min_periods=min_periods).corr()
+
+    # rolling_corr has a 2-level MultiIndex: (date, ticker). Group by date and
+    # build one distance matrix per date — only a cheap Python groupby, not a
+    # full correlation computation.
+    for dt, block in rolling_corr.groupby(level=0):
+        corr = block.droplevel(0).reindex(index=tickers, columns=tickers)
+        if corr.isna().all().all():
+            continue  # min_periods not met for this date
         # transform correlation to distance
         dist = np.sqrt(2.0 * (1.0 - corr.clip(-1 + eps, 1 - eps)))
         # small numerical floor
-        dist = dist.fillna(0.0).clip(lower=0.0)
-        out[dt] = dist
+        out[dt] = dist.fillna(0.0).clip(lower=0.0)
 
     return out
 
@@ -184,18 +190,16 @@ def gravity_force_matrix(
     Why we need it:
         Encodes the "pull" between assets: heavier + closer = stronger interaction.
     """
-    # if masses is a DataFrame with a single row/column for a given date, squeeze to Series
+    # if masses is a DataFrame, squeeze single-row or single-column to Series
     if isinstance(masses, pd.DataFrame):
-        # try to convert to Series if it's a single row aligned to 'distances'
-        if masses.ndim == 2:
-            if masses.shape[0] == 1:
-                masses = masses.iloc[0]
-            elif masses.shape[1] == 1:
-                masses = masses.iloc[:, 0]
+        if masses.shape[0] == 1:
+            masses = masses.iloc[0]
+        elif masses.shape[1] == 1:
+            masses = masses.iloc[:, 0]
 
     # ensure alignment of indices/columns
     m = masses.reindex(distances.index)
-    m = m.fillna(median := np.nanmedian(m.values))
+    m = m.fillna(np.nanmedian(m.values))
     # compute outer product of masses
     m_outer = np.outer(m.values, m.values)
     # squared distances with small epsilon to avoid infinities
@@ -224,7 +228,7 @@ def net_force_signal(
         Aggregates pairwise forces into a per-asset "net force" signal, tilted by momentum.
 
     How it works:
-        - For each i, compute sum_j F_ij * sign(momentum_j)  (direction from momentum).
+        - For each i, compute sum_j F_ij * momentum_j  (direction and magnitude from momentum).
         - Optionally row-normalise cross-sectionally to get comparable signals each day.
 
     Why we need it:
@@ -234,8 +238,9 @@ def net_force_signal(
     if isinstance(momentum, pd.Series):
         # Broadcast momentum across rows so each row uses the same vector
         mom_vec = momentum.reindex(F.columns).fillna(0.0).values
-        # Multiply each column j by sign(mom_j)
-        directed = F.values * np.sign(mom_vec)[None, :]
+        # Multiply each column j by the actual momentum value (not just its sign),
+        # so stronger-momentum assets exert proportionally more directional pull.
+        directed = F.values * mom_vec[None, :]
         # Sum across columns to get net force for each row i
         net = directed.sum(axis=1)
         # Wrap as Series
@@ -244,10 +249,8 @@ def net_force_signal(
     else:
         # DataFrame momentum: align and use date-wise direction
         momentum = momentum.reindex(columns=F.columns)
-        # If F has no explicit time dimension, we assume it's for one date.
-        # For a time panel, you'll compute this per date outside (see pipeline).
-        mom_vec = np.sign(momentum.values)
-        directed = F.values * mom_vec  # element-wise multiply each column by sign of mom
+        # Use actual momentum values as weights (not just sign)
+        directed = F.values * momentum.values
         net = directed.sum(axis=1)
         s = pd.Series(net, index=F.index, name="net_force")
         return s if not normalise else (s - s.mean()) / (s.std() + 1e-12)
@@ -269,6 +272,8 @@ def gravity_signals_pipeline(
     dist_min_periods: int = 30,
     momentum_lookback: int = 20,
     momentum_kind: str = "log",
+    reversal_lookback: Optional[int] = None,
+    reversal_weight: float = 0.3,
     G: float = 1.0,
     eps: float = 1e-6,
     force_cap: Optional[float] = None,
@@ -280,7 +285,7 @@ def gravity_signals_pipeline(
           1) Compute masses (dollar volume or market cap).
           2) Compute rolling correlation distances.
           3) For each date with a distance matrix, compute force matrix and net-force signal
-             tilted by momentum.
+             tilted by a combined direction = long-term momentum - reversal_weight * short-term momentum.
           4) Optionally z-score signals cross-sectionally per day.
 
         Returns a DataFrame of daily signals (index=date, columns=assets).
@@ -288,6 +293,8 @@ def gravity_signals_pipeline(
     How it works:
         - Uses compute_masses, correlation_distance, gravity_force_matrix, compute_momentum,
           and net_force_signal in a loop over dates where distance is defined.
+        - If reversal_lookback is set, a short-term reversal component is subtracted from
+          the momentum direction, combining two documented anomalies in one signal.
 
     Why we need it:
         Provides a single, clean entry point to generate signals you can backtest or chart.
@@ -298,14 +305,14 @@ def gravity_signals_pipeline(
         
     chosen_method = mass_method
     if mass_method == "dollar_volume" and volume is None:
-        logger.warning(
-            "mass_method='dollar_volume' requires 'volume', but none was provided."
-            " falling back to mass_method = 'equal'"
+        warnings.warn(
+            "mass_method='dollar_volume' requires 'volume', but none was provided. "
+            "Falling back to mass_method='equal'."
         )
         chosen_method = "equal"
-    
+
     if mass_method == "market_cap" and market_caps is None:
-        logger.warning(
+        warnings.warn(
             "mass_method='market_cap' requires 'market_caps', but none provided. "
             "Falling back to mass_method='equal'."
         )
@@ -316,24 +323,38 @@ def gravity_signals_pipeline(
         prices=prices,
         volume=volume,
         market_caps=market_caps,
-        method=mass_method,
+        method=chosen_method,
         roll_window=mass_window,
     )
     
-    massess = masses.ffill().bfill() # to ensure masses have minimal gaps 
+    masses = masses.ffill().bfill() # to ensure masses have minimal gaps
     
-    # Momentum used for direction; z-scored cross-sectionally
+    # Long-term momentum used as primary direction signal (z-scored cross-sectionally)
     mom = compute_momentum(
         prices=prices,
         lookback=momentum_lookback,
         kind=momentum_kind,
     )
 
-    # Rolling correlation distance matrices per date
+    # Optional: subtract a short-term reversal component.
+    # Stocks that surged recently tend to mean-revert; reducing their directional
+    # pull improves signal quality at medium-to-long horizons.
+    if reversal_lookback is not None:
+        rev = compute_momentum(
+            prices=prices,
+            lookback=reversal_lookback,
+            kind=momentum_kind,
+        )
+        mom = _zscore_by_row(mom - reversal_weight * rev)
+
+    # Rolling correlation distance matrices per date.
+    # min_periods must be <= window; clamp silently so configs like
+    # {dist_window=20, dist_min_periods=30} don't raise ValueError.
+    effective_min_periods = min(dist_min_periods, dist_window)
     dist_mats = correlation_distance(
         returns=returns,
         window=dist_window,
-        min_periods=dist_min_periods,
+        min_periods=effective_min_periods,
         eps=eps,
     )
 
@@ -342,8 +363,9 @@ def gravity_signals_pipeline(
 
     # Iterate only over dates for which we have a valid distance matrix
     for dt, dist in dist_mats.items():
-        # Extract masses for this date; forward-fill to ensure availability
-        m_t = masses.loc[:dt].iloc[-1].reindex(dist.index, fill_value=(0.0))
+        # Extract masses for this date directly — masses is fully indexed to
+        # prices.index and has no NaN after ffill().bfill(), so loc[dt] is safe.
+        m_t = masses.loc[dt].reindex(dist.index, fill_value=0.0)
         # Compute pairwise forces at this date
         F_t = gravity_force_matrix(
             masses=m_t,
@@ -353,15 +375,14 @@ def gravity_signals_pipeline(
             cap=force_cap,
         )
         # Use momentum direction at 'dt' (per-asset)
-        mom_t = mom.reindex(index=[dt]).iloc[0].reindex(F_t.columns).fillna(0.0) # fill missing momemtum with 0
+        mom_t = mom.loc[dt].reindex(F_t.columns).fillna(0.0)
         # Net force per asset at 'dt'
         s_t = net_force_signal(F_t, momentum=mom_t, normalise=False)
         # Store
         signals[dt] = s_t
 
     # Concatenate daily Series into a DataFrame (index=date, columns=assets)
-    signal_df = pd.DataFrame(signals).T # .reindex(index=prices.index)
-    signal_df = pd.DataFrame(signals).T.reindex(index=prices.index) # align to full date index
+    signal_df = pd.DataFrame(signals).T.reindex(index=prices.index)  # align to full date index
 
     # Optionally z-score per day to stabilise scale
     if zscore_signals:
@@ -410,13 +431,16 @@ def information_coefficient(
         y = y[mask]
         if len(x) < 3:
             continue
-        if method == "spearman":
-            # rank transform then Pearson on ranks
-            x_rank = x.rank()
-            y_rank = y.rank()
-            val = x_rank.corr(y_rank)
-        else:
-            val = x.corr(y)
+        # Suppress divide-by-zero from np.corrcoef when a stock has all-tied
+        # ranks (zero std). The NaN result is filtered by the pd.notna check below.
+        with np.errstate(invalid="ignore", divide="ignore"):
+            if method == "spearman":
+                # rank transform then Pearson on ranks
+                x_rank = x.rank()
+                y_rank = y.rank()
+                val = x_rank.corr(y_rank)
+            else:
+                val = x.corr(y)
         if pd.notna(val):
             ic_values.append(val)
             dates.append(dt)
